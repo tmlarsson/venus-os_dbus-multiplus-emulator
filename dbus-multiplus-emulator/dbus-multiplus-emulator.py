@@ -204,33 +204,7 @@ class DbusMultiPlusEmulator:
                 }
             }
         )
-        dbus_tree.update(
-            {
-                "com.victronenergy.pvinverter": {
-                    "/Ac/Energy/Forward": dummy,
-                    "/Ac/Power": dummy,
-                    "/Ac/L1/Current": dummy,
-                    "/Ac/L1/Energy/Forward": dummy,
-                    "/Ac/L1/Power": dummy,
-                    "/Ac/L1/Voltage": dummy,
-                    "/Ac/L2/Current": dummy,
-                    "/Ac/L2/Energy/Forward": dummy,
-                    "/Ac/L2/Power": dummy,
-                    "/Ac/L2/Voltage": dummy,
-                    "/Ac/L3/Current": dummy,
-                    "/Ac/L3/Energy/Forward": dummy,
-                    "/Ac/L3/Power": dummy,
-                    "/Ac/L3/Voltage": dummy,
-                }
-            }
-        )
-        
-        self.pv_out_power = {
-            "L1": None,
-            "L2": None,
-            "L3": None,
-        }
-
+       
 
         # create empty dictionary will be updated later
         self.gridValues = {
@@ -300,68 +274,55 @@ class DbusMultiPlusEmulator:
         ) or (dbusServiceNameGrid != "" and dbusServiceName == dbusServiceNameGrid):
             self.gridValues.update({str(dbusPath): changes["Value"]})
             
-        if dbusServiceName.startswith("com.victronenergy.pvinverter"):
-            for phase in phases:
-                if dbusPath == f"/Ac/{phase}/Power":
-                    self.pv_out_power[phase] = changes["Value"]
-
-
-        # print('_dbus_value_changed')
-        # print(dbusServiceName)
-        # print(dbusPath)
-        # print(dict)
-        # print(changes)
-        # print(deviceInstance)
-
-        # print(self.batteryValues)
-        # print(self.gridValues)
 
     def _device_added(self, service, instance, do_service_change=True):
-        # print('_device_added')
-        # print(service)
-        # print(instance)
-        # print(do_service_change)
 
         pass
 
     def _device_removed(self, service, instance):
-        # print('_device_added')
-        # print(service)
-        # print(instance)
-
+    
         pass
 
     def _update(self):
-        logging.info("Updating dbus values...")
-
         ac_in_power = {phase: self.gridValues.get(f"/Ac/{phase}/Power", 0) for phase in phases}
         ac_in_voltage = {phase: self.gridValues.get(f"/Ac/{phase}/Voltage", 0) for phase in phases}
-        
-        logging.info("Reading pv...")
-        pv_out_power = {
-            phase: self.pv_out_power.get(phase, 0) for phase in phases
-        }
-        logging.info("Read pv... %s" % pv_out_power)
-        
-        ac_out_power = {phase: - pv_out_power[phase] - ac_in_power[phase] for phase in phases}
-        
-        logging.info("Ac input power: %s" % ac_in_power)
 
-        ac_in = {phase: {
+        # Ac out power is always the same a the grid power as we do not have a ac in pv inverter
+        # or any battery which could be inverted to ac
+        ac_out_power = {phase: ac_in_power[phase] for phase in phases}
+
+        ac_in = {}
+        for phase in phases:
+            try:
+                ac_in[phase] = {
                     "current": round(ac_in_power[phase] / ac_in_voltage[phase], 2) if ac_in_voltage[phase] > 0 else 0,
                     "power": ac_in_power[phase],
                     "voltage": ac_in_voltage[phase],
-                } for phase in phases}
-        
-        logging.info("Ac input power: %s" % ac_in_power)
+                }
+            except ZeroDivisionError:
+                logging.error(f"ZeroDivisionError for phase {phase}: voltage is zero")
+                ac_in[phase] = {
+                    "current": 0,
+                    "power": ac_in_power[phase],
+                    "voltage": ac_in_voltage[phase],
+                }
 
-        ac_out = {phase: {
+        ac_out = {}
+        for phase in phases:
+            try:
+                ac_out[phase] = {
                     "current": round(ac_out_power[phase] / ac_in_voltage[phase], 2) if ac_in_voltage[phase] > 0 else 0,
                     "power": ac_out_power[phase],
                     "voltage": ac_in_voltage[phase],
-                } for phase in phases}
-        
-        logging.info("Ac output power: %s" % ac_out_power)
+                }
+            except ZeroDivisionError:
+                logging.error(f"ZeroDivisionError for phase {phase}: voltage is zero")
+                ac_out[phase] = {
+                    "current": 0,
+                    "power": ac_out_power[phase],
+                    "voltage": ac_in_voltage[phase],
+                }
+
 
         try:
             self._dbusservice["/Ac/ActiveIn/ActiveInput"] = 0
@@ -371,7 +332,6 @@ class DbusMultiPlusEmulator:
             self._dbusservice["/Ac/NumberOfAcInputs"] = 1
             self._dbusservice["/Ac/NumberOfPhases"] = 3
             self._dbusservice["/Ac/Out/NominalInverterPower"] = 4500
-            logging.info("Successfully updated dbus values")
         except Exception as e:
             logging.error("Error updating dbus values: %s" % str(e))
 
@@ -392,9 +352,6 @@ class DbusMultiPlusEmulator:
             self._dbusservice[f"/Ac/Out/{phase}/S"] = ac_out[phase]["power"]
             self._dbusservice[f"/Ac/Out/{phase}/V"] = ac_out[phase]["voltage"]
             
-        logging.info("Updated dbus values per phase...")
-        
-        logging.info("Ac out total power: %s" % sum(ac_out_power.values()))
 
         # Overall values
         self._dbusservice["/Ac/ActiveIn/P"] = sum(ac_in_power.values())
