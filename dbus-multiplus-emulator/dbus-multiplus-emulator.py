@@ -14,8 +14,19 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"
 from vedbus import VeDbusService
 from dbusmonitor import DbusMonitor
 
-# use WARNING for default, INFO for displaying actual steps and values, DEBUG for debugging
-logging.basicConfig(level=logging.WARNING)
+# Configure logging
+log_dir = os.path.dirname(os.path.realpath(__file__))
+log_file = os.path.join(log_dir, "current.log")
+
+logging.basicConfig(
+    format='%(asctime)s,%(msecs)d %(name)s %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler()
+    ]
+)
 
 
 # ------------------ USER CHANGABLE VALUES | START ------------------
@@ -34,7 +45,7 @@ dbusServiceNameGrid = ""
 # specify on which phase the AC PV Inverter is connected
 # e.g. L1, L2 or L3
 # default: L1
-phase = "L1"
+phases = ["L1", "L2", "L3"]
 
 # ------------------ USER CHANGABLE VALUES | END --------------------
 
@@ -193,6 +204,34 @@ class DbusMultiPlusEmulator:
                 }
             }
         )
+        dbus_tree.update(
+            {
+                "com.victronenergy.pvinverter": {
+                    "/Ac/Energy/Forward": dummy,
+                    "/Ac/Power": dummy,
+                    "/Ac/L1/Current": dummy,
+                    "/Ac/L1/Energy/Forward": dummy,
+                    "/Ac/L1/Power": dummy,
+                    "/Ac/L1/Voltage": dummy,
+                    "/Ac/L2/Current": dummy,
+                    "/Ac/L2/Energy/Forward": dummy,
+                    "/Ac/L2/Power": dummy,
+                    "/Ac/L2/Voltage": dummy,
+                    "/Ac/L3/Current": dummy,
+                    "/Ac/L3/Energy/Forward": dummy,
+                    "/Ac/L3/Power": dummy,
+                    "/Ac/L3/Voltage": dummy,
+                }
+            }
+        )
+        
+        self.pv_out_power = {
+            "L1": None,
+            "L2": None,
+            "L3": None,
+        }
+
+
         # create empty dictionary will be updated later
         self.gridValues = {
             "/Ac/L1/Power": None,
@@ -260,6 +299,12 @@ class DbusMultiPlusEmulator:
             and dbusServiceName.startswith("com.victronenergy.grid")
         ) or (dbusServiceNameGrid != "" and dbusServiceName == dbusServiceNameGrid):
             self.gridValues.update({str(dbusPath): changes["Value"]})
+            
+        if dbusServiceName.startswith("com.victronenergy.pvinverter"):
+            for phase in phases:
+                if dbusPath == f"/Ac/{phase}/Power":
+                    self.pv_out_power[phase] = changes["Value"]
+
 
         # print('_dbus_value_changed')
         # print(dbusServiceName)
@@ -287,281 +332,75 @@ class DbusMultiPlusEmulator:
         pass
 
     def _update(self):
-        global data_watt_hours, data_watt_hours_timespan, data_watt_hours_save, data_watt_hours_storage_file, data_watt_hours_working_file, json_data, timestamp_storage_file
+        logging.info("Updating dbus values...")
 
-        """
-        logging.error(
-            f'self.gridValues["/Ac/Power"]: {self.gridValues["/Ac/Power"]} and self.batteryValues["/Dc/0/Power"]: {self.batteryValues["/Dc/0/Power"]}'
-        )
-        #"""
-        dc_power = (
-            self.batteryValues["/Dc/0/Power"]
-            if self.batteryValues["/Dc/0/Power"] is not None
-            else 0
-        )
-        ac_in_power_key = "/Ac/" + phase + "/Power"
-        ac_in_power = (
-            self.gridValues[ac_in_power_key]
-            if self.gridValues[ac_in_power_key] is not None
-            else 0
-        )
-        ac_in_voltage_key = "/Ac/" + phase + "/Voltage"
-        ac_in_voltage = (
-            self.gridValues[ac_in_voltage_key]
-            if self.gridValues[ac_in_voltage_key] is not None
-            else 0
-        )
-
-        ac_out_power = round(0 - dc_power - ac_in_power)
-
-        ac_in = {
-            "current": round(ac_in_power / ac_in_voltage, 2)
-            if ac_in_voltage > 0
-            else 0,
-            "power": ac_in_power,
-            "voltage": ac_in_voltage,
+        ac_in_power = {phase: self.gridValues.get(f"/Ac/{phase}/Power", 0) for phase in phases}
+        ac_in_voltage = {phase: self.gridValues.get(f"/Ac/{phase}/Voltage", 0) for phase in phases}
+        
+        logging.info("Reading pv...")
+        pv_out_power = {
+            phase: self.pv_out_power.get(phase, 0) for phase in phases
         }
-        ac_out = {
-            "current": round(ac_out_power / ac_in_voltage, 2)
-            if ac_in_voltage > 0
-            else 0,
-            "power": ac_out_power,
-            "voltage": ac_in_voltage,
-        }
+        logging.info("Read pv... %s" % pv_out_power)
+        
+        ac_out_power = {phase: - pv_out_power[phase] - ac_in_power[phase] for phase in phases}
+        
+        logging.info("Ac input power: %s" % ac_in_power)
 
-        # ##################################################################################################################
+        ac_in = {phase: {
+                    "current": round(ac_in_power[phase] / ac_in_voltage[phase], 2) if ac_in_voltage[phase] > 0 else 0,
+                    "power": ac_in_power[phase],
+                    "voltage": ac_in_voltage[phase],
+                } for phase in phases}
+        
+        logging.info("Ac input power: %s" % ac_in_power)
 
-        # # # calculate watthours
-        # measure power and calculate watthours, since enphase provides only watthours for production/import/consumption and no export
-        # divide charging and discharging from dc
-        # charging (+)
-        dc_power_charging = dc_power if dc_power > 0 else 0
-        # discharging (-)
-        dc_power_discharging = dc_power * -1 if dc_power < 0 else 0
+        ac_out = {phase: {
+                    "current": round(ac_out_power[phase] / ac_in_voltage[phase], 2) if ac_in_voltage[phase] > 0 else 0,
+                    "power": ac_out_power[phase],
+                    "voltage": ac_in_voltage[phase],
+                } for phase in phases}
+        
+        logging.info("Ac output power: %s" % ac_out_power)
 
-        # timestamp
-        timestamp = int(time())
+        try:
+            self._dbusservice["/Ac/ActiveIn/ActiveInput"] = 0
+            self._dbusservice["/Ac/ActiveIn/Connected"] = 1
+            self._dbusservice["/Ac/ActiveIn/CurrentLimit"] = 16
+            self._dbusservice["/Ac/ActiveIn/CurrentLimitIsAdjustable"] = 1
+            self._dbusservice["/Ac/NumberOfAcInputs"] = 1
+            self._dbusservice["/Ac/NumberOfPhases"] = 3
+            self._dbusservice["/Ac/Out/NominalInverterPower"] = 4500
+            logging.info("Successfully updated dbus values")
+        except Exception as e:
+            logging.error("Error updating dbus values: %s" % str(e))
 
-        # check if x seconds are passed, if not sum values for calculation
-        if data_watt_hours["time_creation"] + data_watt_hours_timespan > timestamp:
-            data_watt_hours_dc = {
-                "charging": round(
-                    data_watt_hours["dc"]["charging"] + dc_power_charging
-                    if "dc" in data_watt_hours
-                    else dc_power_charging,
-                    3,
-                ),
-                "discharging": round(
-                    data_watt_hours["dc"]["discharging"] + dc_power_discharging
-                    if "dc" in data_watt_hours
-                    else dc_power_discharging,
-                    3,
-                ),
-            }
+        
+        logging.info("Updating dbus values...")
 
-            data_watt_hours.update(
-                {
-                    "dc": data_watt_hours_dc,
-                    "count": data_watt_hours["count"] + 1,
-                }
-            )
+        for phase in phases:
+            self._dbusservice[f"/Ac/ActiveIn/{phase}/F"] = grid_frequency
+            self._dbusservice[f"/Ac/ActiveIn/{phase}/I"] = ac_in[phase]["current"]
+            self._dbusservice[f"/Ac/ActiveIn/{phase}/P"] = ac_in[phase]["power"]
+            self._dbusservice[f"/Ac/ActiveIn/{phase}/S"] = ac_in[phase]["power"]
+            self._dbusservice[f"/Ac/ActiveIn/{phase}/V"] = ac_in[phase]["voltage"]
 
-            logging.info("--> data_watt_hours(): %s" % json.dumps(data_watt_hours))
+            self._dbusservice[f"/Ac/Out/{phase}/F"] = grid_frequency
+            self._dbusservice[f"/Ac/Out/{phase}/I"] = ac_out[phase]["current"]
+            self._dbusservice[f"/Ac/Out/{phase}/NominalInverterPower"] = 4500
+            self._dbusservice[f"/Ac/Out/{phase}/P"] = ac_out[phase]["power"]
+            self._dbusservice[f"/Ac/Out/{phase}/S"] = ac_out[phase]["power"]
+            self._dbusservice[f"/Ac/Out/{phase}/V"] = ac_out[phase]["voltage"]
+            
+        logging.info("Updated dbus values per phase...")
+        
+        logging.info("Ac out total power: %s" % sum(ac_out_power.values()))
 
-        # build mean, calculate time diff and Wh and write to file
-        else:
-            # check if file in volatile storage exists
-            if os.path.isfile(data_watt_hours_working_file):
-                with open(data_watt_hours_working_file, "r") as file:
-                    file = open(data_watt_hours_working_file, "r")
-                    data_watt_hours_old = json.load(file)
-                    logging.info("Loaded JSON")
-                    logging.info(json.dumps(data_watt_hours_old))
-
-            # if not, check if file in persistent storage exists
-            elif os.path.isfile(data_watt_hours_storage_file):
-                with open(data_watt_hours_storage_file, "r") as file:
-                    file = open(data_watt_hours_storage_file, "r")
-                    data_watt_hours_old = json.load(file)
-                    logging.info("Loaded JSON from persistent storage")
-                    logging.info(json.dumps(data_watt_hours_old))
-
-            # if not, generate data
-            else:
-                data_watt_hours_old_dc = {
-                    "charging": 0,
-                    "discharging": 0,
-                }
-                data_watt_hours_old = {"dc": data_watt_hours_old_dc}
-                logging.info("Generated JSON")
-                logging.info(json.dumps(data_watt_hours_old))
-
-            # factor to calculate Watthours: mean power * measuuring period / 3600 seconds (1 hour)
-            factor = (timestamp - data_watt_hours["time_creation"]) / 3600
-
-            dc_charging = round(
-                data_watt_hours_old["dc"]["charging"]
-                + (
-                    data_watt_hours["dc"]["charging"]
-                    / data_watt_hours["count"]
-                    * factor
-                )
-                / 1000,
-                3,
-            )
-            dc_discharging = round(
-                data_watt_hours_old["dc"]["discharging"]
-                + (
-                    data_watt_hours["dc"]["discharging"]
-                    / data_watt_hours["count"]
-                    * factor
-                )
-                / 1000,
-                3,
-            )
-
-            # update previously set data
-            json_data = {
-                "dc": {
-                    "charging": dc_charging,
-                    "discharging": dc_discharging,
-                }
-            }
-
-            # save data to volatile storage
-            with open(data_watt_hours_working_file, "w") as file:
-                file.write(json.dumps(json_data))
-
-            # save data to persistent storage if time is passed
-            if timestamp_storage_file + data_watt_hours_save < timestamp:
-                with open(data_watt_hours_storage_file, "w") as file:
-                    file.write(json.dumps(json_data))
-                timestamp_storage_file = timestamp
-                logging.info(
-                    "Written JSON for OutToInverter (charging)/InverterToOut (discharging) to persistent storage."
-                )
-
-            # begin a new cycle
-            data_watt_hours_dc = {
-                "charging": round(dc_power_charging, 3),
-                "discharging": round(dc_power_discharging, 3),
-            }
-
-            data_watt_hours = {
-                "time_creation": timestamp,
-                "dc": data_watt_hours_dc,
-                "count": 1,
-            }
-
-            logging.info("--> data_watt_hours(): %s" % json.dumps(data_watt_hours))
-
-        # ##################################################################################################################
-
-        self._dbusservice["/Ac/ActiveIn/ActiveInput"] = 0
-        self._dbusservice["/Ac/ActiveIn/Connected"] = 1
-        self._dbusservice["/Ac/ActiveIn/CurrentLimit"] = 16
-        self._dbusservice["/Ac/ActiveIn/CurrentLimitIsAdjustable"] = 1
-
-        # get values from BMS
-        # for bubble flow in chart and load visualization
-        # L1 ----
-        self._dbusservice["/Ac/ActiveIn/L1/F"] = (
-            grid_frequency if phase == "L1" else None
-        )
-        self._dbusservice["/Ac/ActiveIn/L1/I"] = (
-            ac_in["current"] if phase == "L1" else None
-        )
-        self._dbusservice["/Ac/ActiveIn/L1/P"] = (
-            ac_in["power"] if phase == "L1" else None
-        )
-        self._dbusservice["/Ac/ActiveIn/L1/S"] = (
-            ac_in["power"] if phase == "L1" else None
-        )
-        self._dbusservice["/Ac/ActiveIn/L1/V"] = (
-            ac_in["voltage"] if phase == "L1" else None
-        )
-
-        # L2 ----
-        self._dbusservice["/Ac/ActiveIn/L2/F"] = (
-            grid_frequency if phase == "L2" else None
-        )
-        self._dbusservice["/Ac/ActiveIn/L2/I"] = (
-            ac_in["current"] if phase == "L2" else None
-        )
-        self._dbusservice["/Ac/ActiveIn/L2/P"] = (
-            ac_in["power"] if phase == "L2" else None
-        )
-        self._dbusservice["/Ac/ActiveIn/L2/S"] = (
-            ac_in["power"] if phase == "L2" else None
-        )
-        self._dbusservice["/Ac/ActiveIn/L2/V"] = (
-            ac_in["voltage"] if phase == "L2" else None
-        )
-
-        # L3 ----
-        self._dbusservice["/Ac/ActiveIn/L3/F"] = (
-            grid_frequency if phase == "L3" else None
-        )
-        self._dbusservice["/Ac/ActiveIn/L3/I"] = (
-            ac_in["current"] if phase == "L3" else None
-        )
-        self._dbusservice["/Ac/ActiveIn/L3/P"] = (
-            ac_in["power"] if phase == "L3" else None
-        )
-        self._dbusservice["/Ac/ActiveIn/L3/S"] = (
-            ac_in["power"] if phase == "L3" else None
-        )
-        self._dbusservice["/Ac/ActiveIn/L3/V"] = (
-            ac_in["voltage"] if phase == "L3" else None
-        )
-
-        # get values from BMS
-        # for bubble flow in chart and load visualization
-        self._dbusservice["/Ac/ActiveIn/P"] = ac_in["power"]
-        self._dbusservice["/Ac/ActiveIn/S"] = ac_in["power"]
-
-        self._dbusservice["/Ac/In/1/CurrentLimit"] = 16
-        self._dbusservice["/Ac/In/1/CurrentLimitIsAdjustable"] = 1
-
-        self._dbusservice["/Ac/In/2/CurrentLimit"] = None
-        self._dbusservice["/Ac/In/2/CurrentLimitIsAdjustable"] = None
-
-        self._dbusservice["/Ac/NumberOfAcInputs"] = 1
-        self._dbusservice["/Ac/NumberOfPhases"] = 1
-
-        # L1 ----
-        self._dbusservice["/Ac/Out/L1/F"] = grid_frequency if phase == "L1" else None
-        self._dbusservice["/Ac/Out/L1/I"] = ac_out["current"] if phase == "L1" else None
-        self._dbusservice["/Ac/Out/L1/NominalInverterPower"] = (
-            4500 if phase == "L1" else None
-        )
-        self._dbusservice["/Ac/Out/L1/P"] = ac_out["power"] if phase == "L1" else None
-        self._dbusservice["/Ac/Out/L1/S"] = ac_out["power"] if phase == "L1" else None
-        self._dbusservice["/Ac/Out/L1/V"] = ac_out["voltage"] if phase == "L1" else None
-
-        # L2 ----
-        self._dbusservice["/Ac/Out/L2/F"] = None if phase == "L2" else None
-        self._dbusservice["/Ac/Out/L2/I"] = None if phase == "L2" else None
-        self._dbusservice["/Ac/Out/L2/NominalInverterPower"] = (
-            4500 if phase == "L2" else None
-        )
-        self._dbusservice["/Ac/Out/L2/P"] = None if phase == "L2" else None
-        self._dbusservice["/Ac/Out/L2/S"] = None if phase == "L2" else None
-        self._dbusservice["/Ac/Out/L2/V"] = None if phase == "L2" else None
-
-        # L3 ----
-        self._dbusservice["/Ac/Out/L3/F"] = None if phase == "L3" else None
-        self._dbusservice["/Ac/Out/L3/I"] = None if phase == "L3" else None
-        self._dbusservice["/Ac/Out/L3/NominalInverterPower"] = (
-            4500 if phase == "L3" else None
-        )
-        self._dbusservice["/Ac/Out/L3/P"] = None if phase == "L3" else None
-        self._dbusservice["/Ac/Out/L3/S"] = None if phase == "L3" else None
-        self._dbusservice["/Ac/Out/L3/V"] = None if phase == "L3" else None
-
-        self._dbusservice["/Ac/Out/NominalInverterPower"] = 4500
-        self._dbusservice["/Ac/Out/P"] = ac_out["power"]
-        self._dbusservice["/Ac/Out/S"] = ac_out["power"]
+        # Overall values
+        self._dbusservice["/Ac/ActiveIn/P"] = sum(ac_in_power.values())
+        self._dbusservice["/Ac/ActiveIn/S"] = sum(ac_in_power.values())
+        self._dbusservice["/Ac/Out/P"] = sum(ac_out_power.values())
+        self._dbusservice["/Ac/Out/S"] = sum(ac_out_power.values())
 
         self._dbusservice["/Ac/PowerMeasurementType"] = 4
         self._dbusservice["/Ac/State/IgnoreAcIn1"] = 0
