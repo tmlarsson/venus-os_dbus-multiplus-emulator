@@ -28,7 +28,6 @@ logging.basicConfig(
     ]
 )
 
-
 # ------------------ USER CHANGABLE VALUES | START ------------------
 
 # enter grid frequency
@@ -284,275 +283,242 @@ class DbusMultiPlusEmulator:
         pass
 
     def _update(self):
-        ac_in_power = {phase: self.gridValues.get(f"/Ac/{phase}/Power", 0) for phase in phases}
-        ac_in_voltage = {phase: self.gridValues.get(f"/Ac/{phase}/Voltage", 0) for phase in phases}
+        try:
+            ac_in_power = {phase: self.gridValues.get(f"/Ac/{phase}/Power", 0) for phase in phases}
+            ac_in_voltage = {phase: self.gridValues.get(f"/Ac/{phase}/Voltage", 0) for phase in phases}
 
-        # Ac out power is always the same a the grid power as we do not have a ac in pv inverter
-        # or any battery which could be inverted to ac
-        ac_out_power = {phase: ac_in_power[phase] for phase in phases}
+            # Ac out power is always the same as the grid power as we do not have an AC in PV inverter
+            # or any battery which could be inverted to AC
+            ac_out_power = {phase: ac_in_power[phase] for phase in phases}
 
-        ac_in = {}
-        for phase in phases:
-            try:
+            ac_in = {}
+            for phase in phases:
                 ac_in[phase] = {
                     "current": round(ac_in_power[phase] / ac_in_voltage[phase], 2) if ac_in_voltage[phase] > 0 else 0,
                     "power": ac_in_power[phase],
                     "voltage": ac_in_voltage[phase],
                 }
-            except ZeroDivisionError:
-                logging.error(f"ZeroDivisionError for phase {phase}: voltage is zero")
-                ac_in[phase] = {
-                    "current": 0,
-                    "power": ac_in_power[phase],
-                    "voltage": ac_in_voltage[phase],
-                }
 
-        ac_out = {}
-        for phase in phases:
-            try:
+            ac_out = {}
+            for phase in phases:
                 ac_out[phase] = {
                     "current": round(ac_out_power[phase] / ac_in_voltage[phase], 2) if ac_in_voltage[phase] > 0 else 0,
                     "power": ac_out_power[phase],
                     "voltage": ac_in_voltage[phase],
                 }
-            except ZeroDivisionError:
-                logging.error(f"ZeroDivisionError for phase {phase}: voltage is zero")
-                ac_out[phase] = {
-                    "current": 0,
-                    "power": ac_out_power[phase],
-                    "voltage": ac_in_voltage[phase],
-                }
 
+            try:
+                self._dbusservice["/Ac/ActiveIn/ActiveInput"] = 0
+                self._dbusservice["/Ac/ActiveIn/Connected"] = 1
+                self._dbusservice["/Ac/ActiveIn/CurrentLimit"] = 16
+                self._dbusservice["/Ac/ActiveIn/CurrentLimitIsAdjustable"] = 1
+                self._dbusservice["/Ac/NumberOfAcInputs"] = 1
+                self._dbusservice["/Ac/NumberOfPhases"] = 3
+                self._dbusservice["/Ac/Out/NominalInverterPower"] = 4500
+            except Exception as e:
+                logging.error("Error updating dbus values: %s" % str(e))
 
-        try:
-            self._dbusservice["/Ac/ActiveIn/ActiveInput"] = 0
-            self._dbusservice["/Ac/ActiveIn/Connected"] = 1
-            self._dbusservice["/Ac/ActiveIn/CurrentLimit"] = 16
-            self._dbusservice["/Ac/ActiveIn/CurrentLimitIsAdjustable"] = 1
-            self._dbusservice["/Ac/NumberOfAcInputs"] = 1
-            self._dbusservice["/Ac/NumberOfPhases"] = 3
-            self._dbusservice["/Ac/Out/NominalInverterPower"] = 4500
-        except Exception as e:
-            logging.error("Error updating dbus values: %s" % str(e))
+            for phase in phases:
+                self._dbusservice[f"/Ac/ActiveIn/{phase}/F"] = grid_frequency
+                self._dbusservice[f"/Ac/ActiveIn/{phase}/I"] = ac_in[phase]["current"]
+                self._dbusservice[f"/Ac/ActiveIn/{phase}/P"] = ac_in[phase]["power"]
+                self._dbusservice[f"/Ac/ActiveIn/{phase}/S"] = ac_in[phase]["power"]
+                self._dbusservice[f"/Ac/ActiveIn/{phase}/V"] = ac_in[phase]["voltage"]
 
-        
-        logging.info("Updating dbus values...")
+                self._dbusservice[f"/Ac/Out/{phase}/F"] = grid_frequency
+                self._dbusservice[f"/Ac/Out/{phase}/I"] = ac_out[phase]["current"]
+                self._dbusservice[f"/Ac/Out/{phase}/NominalInverterPower"] = 4500
+                self._dbusservice[f"/Ac/Out/{phase}/P"] = ac_out[phase]["power"]
+                self._dbusservice[f"/Ac/Out/{phase}/S"] = ac_out[phase]["power"]
+                self._dbusservice[f"/Ac/Out/{phase}/V"] = ac_out[phase]["voltage"]
 
-        for phase in phases:
-            self._dbusservice[f"/Ac/ActiveIn/{phase}/F"] = grid_frequency
-            self._dbusservice[f"/Ac/ActiveIn/{phase}/I"] = ac_in[phase]["current"]
-            self._dbusservice[f"/Ac/ActiveIn/{phase}/P"] = ac_in[phase]["power"]
-            self._dbusservice[f"/Ac/ActiveIn/{phase}/S"] = ac_in[phase]["power"]
-            self._dbusservice[f"/Ac/ActiveIn/{phase}/V"] = ac_in[phase]["voltage"]
+            # Overall values
+            self._dbusservice["/Ac/ActiveIn/P"] = sum(ac_in_power.values())
+            self._dbusservice["/Ac/ActiveIn/S"] = sum(ac_in_power.values())
+            self._dbusservice["/Ac/Out/P"] = sum(ac_out_power.values())
+            self._dbusservice["/Ac/Out/S"] = sum(ac_out_power.values())
 
-            self._dbusservice[f"/Ac/Out/{phase}/F"] = grid_frequency
-            self._dbusservice[f"/Ac/Out/{phase}/I"] = ac_out[phase]["current"]
-            self._dbusservice[f"/Ac/Out/{phase}/NominalInverterPower"] = 4500
-            self._dbusservice[f"/Ac/Out/{phase}/P"] = ac_out[phase]["power"]
-            self._dbusservice[f"/Ac/Out/{phase}/S"] = ac_out[phase]["power"]
-            self._dbusservice[f"/Ac/Out/{phase}/V"] = ac_out[phase]["voltage"]
-            
+            self._dbusservice["/Ac/PowerMeasurementType"] = 4
+            self._dbusservice["/Ac/State/IgnoreAcIn1"] = 0
+            self._dbusservice["/Ac/State/SplitPhaseL2Passthru"] = None
 
-        # Overall values
-        self._dbusservice["/Ac/ActiveIn/P"] = sum(ac_in_power.values())
-        self._dbusservice["/Ac/ActiveIn/S"] = sum(ac_in_power.values())
-        self._dbusservice["/Ac/Out/P"] = sum(ac_out_power.values())
-        self._dbusservice["/Ac/Out/S"] = sum(ac_out_power.values())
+            self._dbusservice["/Alarms/HighDcCurrent"] = 0
+            self._dbusservice["/Alarms/HighDcVoltage"] = 0
+            self._dbusservice["/Alarms/HighTemperature"] = 0
+            self._dbusservice["/Alarms/L1/HighTemperature"] = 0
+            self._dbusservice["/Alarms/L1/LowBattery"] = 0
+            self._dbusservice["/Alarms/L1/Overload"] = 0
+            self._dbusservice["/Alarms/L1/Ripple"] = 0
+            self._dbusservice["/Alarms/L2/HighTemperature"] = 0
+            self._dbusservice["/Alarms/L2/LowBattery"] = 0
+            self._dbusservice["/Alarms/L2/Overload"] = 0
+            self._dbusservice["/Alarms/L2/Ripple"] = 0
+            self._dbusservice["/Alarms/L3/HighTemperature"] = 0
+            self._dbusservice["/Alarms/L3/LowBattery"] = 0
+            self._dbusservice["/Alarms/L3/Overload"] = 0
+            self._dbusservice["/Alarms/L3/Ripple"] = 0
+            self._dbusservice["/Alarms/LowBattery"] = 0
+            self._dbusservice["/Alarms/Overload"] = 0
+            self._dbusservice["/Alarms/PhaseRotation"] = 0
+            self._dbusservice["/Alarms/Ripple"] = 0
+            self._dbusservice["/Alarms/TemperatureSensor"] = 0
+            self._dbusservice["/Alarms/VoltageSensor"] = 0
 
-        self._dbusservice["/Ac/PowerMeasurementType"] = 4
-        self._dbusservice["/Ac/State/IgnoreAcIn1"] = 0
-        self._dbusservice["/Ac/State/SplitPhaseL2Passthru"] = None
+            self._dbusservice["/BatteryOperationalLimits/BatteryLowVoltage"] = None
+            self._dbusservice[
+                "/BatteryOperationalLimits/MaxChargeCurrent"
+            ] = self.batteryValues["/Info/MaxChargeCurrent"]
+            self._dbusservice[
+                "/BatteryOperationalLimits/MaxChargeVoltage"
+            ] = self.batteryValues["/Info/MaxChargeVoltage"]
+            self._dbusservice[
+                "/BatteryOperationalLimits/MaxDischargeCurrent"
+            ] = self.batteryValues["/Info/MaxDischargeCurrent"]
+            self._dbusservice["/BatterySense/Temperature"] = None
+            self._dbusservice["/BatterySense/Voltage"] = None
 
-        self._dbusservice["/Alarms/HighDcCurrent"] = 0
-        self._dbusservice["/Alarms/HighDcVoltage"] = 0
-        self._dbusservice["/Alarms/HighTemperature"] = 0
-        self._dbusservice["/Alarms/L1/HighTemperature"] = 0
-        self._dbusservice["/Alarms/L1/LowBattery"] = 0
-        self._dbusservice["/Alarms/L1/Overload"] = 0
-        self._dbusservice["/Alarms/L1/Ripple"] = 0
-        self._dbusservice["/Alarms/L2/HighTemperature"] = 0
-        self._dbusservice["/Alarms/L2/LowBattery"] = 0
-        self._dbusservice["/Alarms/L2/Overload"] = 0
-        self._dbusservice["/Alarms/L2/Ripple"] = 0
-        self._dbusservice["/Alarms/L3/HighTemperature"] = 0
-        self._dbusservice["/Alarms/L3/LowBattery"] = 0
-        self._dbusservice["/Alarms/L3/Overload"] = 0
-        self._dbusservice["/Alarms/L3/Ripple"] = 0
-        self._dbusservice["/Alarms/LowBattery"] = 0
-        self._dbusservice["/Alarms/Overload"] = 0
-        self._dbusservice["/Alarms/PhaseRotation"] = 0
-        self._dbusservice["/Alarms/Ripple"] = 0
-        self._dbusservice["/Alarms/TemperatureSensor"] = 0
-        self._dbusservice["/Alarms/VoltageSensor"] = 0
+            self._dbusservice["/Bms/AllowToCharge"] = 1
+            self._dbusservice["/Bms/AllowToChargeRate"] = 0
+            self._dbusservice["/Bms/AllowToDischarge"] = 1
+            self._dbusservice["/Bms/BmsExpected"] = 0
+            self._dbusservice["/Bms/BmsType"] = 0
+            self._dbusservice["/Bms/Error"] = 0
+            self._dbusservice["/Bms/PreAlarm"] = None
 
-        self._dbusservice["/BatteryOperationalLimits/BatteryLowVoltage"] = None
-        self._dbusservice[
-            "/BatteryOperationalLimits/MaxChargeCurrent"
-        ] = self.batteryValues["/Info/MaxChargeCurrent"]
-        self._dbusservice[
-            "/BatteryOperationalLimits/MaxChargeVoltage"
-        ] = self.batteryValues["/Info/MaxChargeVoltage"]
-        self._dbusservice[
-            "/BatteryOperationalLimits/MaxDischargeCurrent"
-        ] = self.batteryValues["/Info/MaxDischargeCurrent"]
-        self._dbusservice["/BatterySense/Temperature"] = None
-        self._dbusservice["/BatterySense/Voltage"] = None
-
-        self._dbusservice["/Bms/AllowToCharge"] = 1
-        self._dbusservice["/Bms/AllowToChargeRate"] = 0
-        self._dbusservice["/Bms/AllowToDischarge"] = 1
-        self._dbusservice["/Bms/BmsExpected"] = 0
-        self._dbusservice["/Bms/BmsType"] = 0
-        self._dbusservice["/Bms/Error"] = 0
-        self._dbusservice["/Bms/PreAlarm"] = None
-
-        # get values from BMS
-        # for bubble flow in GUI
-        self._dbusservice["/Dc/0/Current"] = self.batteryValues["/Dc/0/Current"]
-        self._dbusservice["/Dc/0/MaxChargeCurrent"] = self.batteryValues[
-            "/Info/MaxChargeCurrent"
-        ]
-        self._dbusservice["/Dc/0/Power"] = self.batteryValues["/Dc/0/Power"]
-        self._dbusservice["/Dc/0/Temperature"] = self.batteryValues["/Dc/0/Temperature"]
-        self._dbusservice["/Dc/0/Voltage"] = (
-            self.batteryValues["/Dc/0/Voltage"]
-            if self.batteryValues["/Dc/0/Voltage"] is not None
-            else round(
-                self.batteryValues["/Dc/0/Power"] / self.batteryValues["/Dc/0/Current"],
-                2,
+            # get values from BMS
+            # for bubble flow in GUI
+            self._dbusservice["/Dc/0/Current"] = self.batteryValues["/Dc/0/Current"]
+            self._dbusservice["/Dc/0/MaxChargeCurrent"] = self.batteryValues[
+                "/Info/MaxChargeCurrent"
+            ]
+            self._dbusservice["/Dc/0/Power"] = self.batteryValues["/Dc/0/Power"]
+            self._dbusservice["/Dc/0/Temperature"] = self.batteryValues["/Dc/0/Temperature"]
+            self._dbusservice["/Dc/0/Voltage"] = (
+                self.batteryValues["/Dc/0/Voltage"]
+                if self.batteryValues["/Dc/0/Voltage"] is not None
+                else round(
+                    self.batteryValues["/Dc/0/Power"] / self.batteryValues["/Dc/0/Current"],
+                    2,
+                )
+                if self.batteryValues["/Dc/0/Power"] is not None
+                and self.batteryValues["/Dc/0/Current"] is not None
+                else None
             )
-            if self.batteryValues["/Dc/0/Power"] is not None
-            and self.batteryValues["/Dc/0/Current"] is not None
-            else None
-        )
 
-        # self._dbusservice['/Devices/0/Assistants'] = 0
+            self._dbusservice["/Devices/0/ExtendStatus/ChargeDisabledDueToLowTemp"] = 0
+            self._dbusservice["/Devices/0/ExtendStatus/ChargeIsDisabled"] = None
+            self._dbusservice["/Devices/0/ExtendStatus/GridRelayReport/Code"] = None
+            self._dbusservice["/Devices/0/ExtendStatus/GridRelayReport/Count"] = 0
+            self._dbusservice["/Devices/0/ExtendStatus/GridRelayReport/Reset"] = 0
+            self._dbusservice["/Devices/0/ExtendStatus/HighDcCurrent"] = 0
+            self._dbusservice["/Devices/0/ExtendStatus/HighDcVoltage"] = 0
+            self._dbusservice["/Devices/0/ExtendStatus/IgnoreAcIn1"] = 0
+            self._dbusservice["/Devices/0/ExtendStatus/MainsPllLocked"] = 1
+            self._dbusservice["/Devices/0/ExtendStatus/PcvPotmeterOnZero"] = 0
+            self._dbusservice["/Devices/0/ExtendStatus/PowerPackPreOverload"] = 0
+            self._dbusservice["/Devices/0/ExtendStatus/SocTooLowToInvert"] = 0
+            self._dbusservice["/Devices/0/ExtendStatus/SustainMode"] = 0
+            self._dbusservice["/Devices/0/ExtendStatus/SwitchoverInfo/Connecting"] = 0
+            self._dbusservice["/Devices/0/ExtendStatus/SwitchoverInfo/Delay"] = 0
+            self._dbusservice["/Devices/0/ExtendStatus/SwitchoverInfo/ErrorFlags"] = 0
+            self._dbusservice["/Devices/0/ExtendStatus/TemperatureHighForceBypass"] = 0
+            self._dbusservice["/Devices/0/ExtendStatus/VeBusNetworkQualityCounter"] = 0
+            self._dbusservice["/Devices/0/ExtendStatus/WaitingForRelayTest"] = 0
 
-        self._dbusservice["/Devices/0/ExtendStatus/ChargeDisabledDueToLowTemp"] = 0
-        self._dbusservice["/Devices/0/ExtendStatus/ChargeIsDisabled"] = None
-        self._dbusservice["/Devices/0/ExtendStatus/GridRelayReport/Code"] = None
-        self._dbusservice["/Devices/0/ExtendStatus/GridRelayReport/Count"] = 0
-        self._dbusservice["/Devices/0/ExtendStatus/GridRelayReport/Reset"] = 0
-        self._dbusservice["/Devices/0/ExtendStatus/HighDcCurrent"] = 0
-        self._dbusservice["/Devices/0/ExtendStatus/HighDcVoltage"] = 0
-        self._dbusservice["/Devices/0/ExtendStatus/IgnoreAcIn1"] = 0
-        self._dbusservice["/Devices/0/ExtendStatus/MainsPllLocked"] = 1
-        self._dbusservice["/Devices/0/ExtendStatus/PcvPotmeterOnZero"] = 0
-        self._dbusservice["/Devices/0/ExtendStatus/PowerPackPreOverload"] = 0
-        self._dbusservice["/Devices/0/ExtendStatus/SocTooLowToInvert"] = 0
-        self._dbusservice["/Devices/0/ExtendStatus/SustainMode"] = 0
-        self._dbusservice["/Devices/0/ExtendStatus/SwitchoverInfo/Connecting"] = 0
-        self._dbusservice["/Devices/0/ExtendStatus/SwitchoverInfo/Delay"] = 0
-        self._dbusservice["/Devices/0/ExtendStatus/SwitchoverInfo/ErrorFlags"] = 0
-        self._dbusservice["/Devices/0/ExtendStatus/TemperatureHighForceBypass"] = 0
-        self._dbusservice["/Devices/0/ExtendStatus/VeBusNetworkQualityCounter"] = 0
-        self._dbusservice["/Devices/0/ExtendStatus/WaitingForRelayTest"] = 0
+            self._dbusservice["/Devices/0/InterfaceProtectionLog/0/ErrorFlags"] = None
+            self._dbusservice["/Devices/0/InterfaceProtectionLog/0/Time"] = None
+            self._dbusservice["/Devices/0/InterfaceProtectionLog/1/ErrorFlags"] = None
+            self._dbusservice["/Devices/0/InterfaceProtectionLog/1/Time"] = None
+            self._dbusservice["/Devices/0/InterfaceProtectionLog/2/ErrorFlags"] = None
+            self._dbusservice["/Devices/0/InterfaceProtectionLog/2/Time"] = None
+            self._dbusservice["/Devices/0/InterfaceProtectionLog/3/ErrorFlags"] = None
+            self._dbusservice["/Devices/0/InterfaceProtectionLog/3/Time"] = None
+            self._dbusservice["/Devices/0/InterfaceProtectionLog/4/ErrorFlags"] = None
+            self._dbusservice["/Devices/0/InterfaceProtectionLog/4/Time"] = None
 
-        self._dbusservice["/Devices/0/InterfaceProtectionLog/0/ErrorFlags"] = None
-        self._dbusservice["/Devices/0/InterfaceProtectionLog/0/Time"] = None
-        self._dbusservice["/Devices/0/InterfaceProtectionLog/1/ErrorFlags"] = None
-        self._dbusservice["/Devices/0/InterfaceProtectionLog/1/Time"] = None
-        self._dbusservice["/Devices/0/InterfaceProtectionLog/2/ErrorFlags"] = None
-        self._dbusservice["/Devices/0/InterfaceProtectionLog/2/Time"] = None
-        self._dbusservice["/Devices/0/InterfaceProtectionLog/3/ErrorFlags"] = None
-        self._dbusservice["/Devices/0/InterfaceProtectionLog/3/Time"] = None
-        self._dbusservice["/Devices/0/InterfaceProtectionLog/4/ErrorFlags"] = None
-        self._dbusservice["/Devices/0/InterfaceProtectionLog/4/Time"] = None
+            self._dbusservice["/Devices/0/SerialNumber"] = "HQ00000AA01"
+            self._dbusservice["/Devices/0/Version"] = 2623497
 
-        self._dbusservice["/Devices/0/SerialNumber"] = "HQ00000AA01"
-        self._dbusservice["/Devices/0/Version"] = 2623497
+            self._dbusservice["/Devices/Bms/Version"] = None
+            self._dbusservice["/Devices/Dmc/Version"] = None
+            self._dbusservice["/Devices/NumberOfMultis"] = 1
 
-        self._dbusservice["/Devices/Bms/Version"] = None
-        self._dbusservice["/Devices/Dmc/Version"] = None
-        self._dbusservice["/Devices/NumberOfMultis"] = 1
+            self._dbusservice["/Energy/InverterToAcOut"] = (
+                json_data["dc"]["discharging"]
+                if "dc" in json_data and "discharging" in json_data["dc"]
+                else 0
+            )
+            self._dbusservice["/Energy/OutToInverter"] = (
+                json_data["dc"]["charging"]
+                if "dc" in json_data and "charging" in json_data["dc"]
+                else 0
+            )
 
-        # self._dbusservice["/Energy/AcIn1ToAcOut"] = 0
-        # self._dbusservice["/Energy/AcIn1ToInverter"] = 0
-        # self._dbusservice["/Energy/AcIn2ToAcOut"] = 0
-        # self._dbusservice["/Energy/AcIn2ToInverter"] = 0
-        # self._dbusservice["/Energy/AcOutToAcIn1"] = 0
-        # self._dbusservice["/Energy/AcOutToAcIn2"] = 0
-        # self._dbusservice["/Energy/InverterToAcIn1"] = 0
-        # self._dbusservice["/Energy/InverterToAcIn2"] = 0
-        self._dbusservice["/Energy/InverterToAcOut"] = (
-            json_data["dc"]["discharging"]
-            if "dc" in json_data and "discharging" in json_data["dc"]
-            else 0
-        )
-        self._dbusservice["/Energy/OutToInverter"] = (
-            json_data["dc"]["charging"]
-            if "dc" in json_data and "charging" in json_data["dc"]
-            else 0
-        )
-        # self._dbusservice["/ExtraBatteryCurrent"] = 0
+            self._dbusservice["/FirmwareFeatures/BolFrame"] = 1
+            self._dbusservice["/FirmwareFeatures/BolUBatAndTBatSense"] = 1
+            self._dbusservice["/FirmwareFeatures/CommandWriteViaId"] = 1
+            self._dbusservice["/FirmwareFeatures/IBatSOCBroadcast"] = 1
+            self._dbusservice["/FirmwareFeatures/NewPanelFrame"] = 1
+            self._dbusservice["/FirmwareFeatures/SetChargeState"] = 1
+            self._dbusservice["/FirmwareSubVersion"] = 0
 
-        self._dbusservice["/FirmwareFeatures/BolFrame"] = 1
-        self._dbusservice["/FirmwareFeatures/BolUBatAndTBatSense"] = 1
-        self._dbusservice["/FirmwareFeatures/CommandWriteViaId"] = 1
-        self._dbusservice["/FirmwareFeatures/IBatSOCBroadcast"] = 1
-        self._dbusservice["/FirmwareFeatures/NewPanelFrame"] = 1
-        self._dbusservice["/FirmwareFeatures/SetChargeState"] = 1
-        self._dbusservice["/FirmwareSubVersion"] = 0
+            self._dbusservice["/Hub/ChargeVoltage"] = 55.2
+            self._dbusservice["/Hub4/AssistantId"] = 5
+            self._dbusservice["/Hub4/DisableCharge"] = 0
+            self._dbusservice["/Hub4/DisableFeedIn"] = 0
+            self._dbusservice["/Hub4/DoNotFeedInOvervoltage"] = 1
+            self._dbusservice["/Hub4/FixSolarOffsetTo100mV"] = 1
+            self._dbusservice["/Hub4/L1/AcPowerSetpoint"] = 0
+            self._dbusservice["/Hub4/L1/CurrentLimitedDueToHighTemp"] = 0
+            self._dbusservice["/Hub4/L1/FrequencyVariationOccurred"] = 0
+            self._dbusservice["/Hub4/L1/MaxFeedInPower"] = 32766
+            self._dbusservice["/Hub4/L1/OffsetAddedToVoltageSetpoint"] = 0
+            self._dbusservice["/Hub4/Sustain"] = 0
+            self._dbusservice["/Hub4/TargetPowerIsMaxFeedIn"] = 0
 
-        self._dbusservice["/Hub/ChargeVoltage"] = 55.2
-        self._dbusservice["/Hub4/AssistantId"] = 5
-        self._dbusservice["/Hub4/DisableCharge"] = 0
-        self._dbusservice["/Hub4/DisableFeedIn"] = 0
-        self._dbusservice["/Hub4/DoNotFeedInOvervoltage"] = 1
-        self._dbusservice["/Hub4/FixSolarOffsetTo100mV"] = 1
-        self._dbusservice["/Hub4/L1/AcPowerSetpoint"] = 0
-        self._dbusservice["/Hub4/L1/CurrentLimitedDueToHighTemp"] = 0
-        self._dbusservice["/Hub4/L1/FrequencyVariationOccurred"] = 0
-        self._dbusservice["/Hub4/L1/MaxFeedInPower"] = 32766
-        self._dbusservice["/Hub4/L1/OffsetAddedToVoltageSetpoint"] = 0
-        self._dbusservice["/Hub4/Sustain"] = 0
-        self._dbusservice["/Hub4/TargetPowerIsMaxFeedIn"] = 0
+            self._dbusservice["/Leds/Absorption"] = (
+                1 if self.batteryValues["/Info/ChargeMode"].startswith("Absorption") else 0
+            )
+            self._dbusservice["/Leds/Bulk"] = (
+                1 if self.batteryValues["/Info/ChargeMode"].startswith("Bulk") else 0
+            )
+            self._dbusservice["/Leds/Float"] = (
+                1 if self.batteryValues["/Info/ChargeMode"].startswith("Float") else 0
+            )
+            self._dbusservice["/Leds/Inverter"] = 1
+            self._dbusservice["/Leds/LowBattery"] = 0
+            self._dbusservice["/Leds/Mains"] = 1
+            self._dbusservice["/Leds/Overload"] = 0
+            self._dbusservice["/Leds/Temperature"] = 0
 
-        # '/Interfaces/Mk2/Connection'] = '/dev/ttyS3'
-        # '/Interfaces/Mk2/ProductId'] = 4464
-        # '/Interfaces/Mk2/ProductName'] = 'MK3'
-        # '/Interfaces/Mk2/Status/BusFreeMode'] = 1
-        # '/Interfaces/Mk2/Tunnel'] = None
-        # '/Interfaces/Mk2/Version'] = 1170212
+            self._dbusservice["/Mode"] = 3
+            self._dbusservice["/ModeIsAdjustable"] = 1
+            self._dbusservice["/PvInverter/Disable"] = 0
+            self._dbusservice["/Quirks"] = 0
+            self._dbusservice["/RedetectSystem"] = 0
+            self._dbusservice["/Settings/Alarm/System/GridLost"] = 1
+            self._dbusservice["/Settings/SystemSetup/AcInput1"] = 1
+            self._dbusservice["/Settings/SystemSetup/AcInput2"] = 0
+            self._dbusservice["/ShortIds"] = 1
+            self._dbusservice["/Soc"] = self.batteryValues["/Soc"]
+            self._dbusservice["/State"] = 8
+            self._dbusservice["/SystemReset"] = None
+            self._dbusservice["/VebusChargeState"] = 1
+            self._dbusservice["/VebusError"] = 0
+            self._dbusservice["/VebusMainState"] = 9
 
-        self._dbusservice["/Leds/Absorption"] = (
-            1 if self.batteryValues["/Info/ChargeMode"].startswith("Absorption") else 0
-        )
-        self._dbusservice["/Leds/Bulk"] = (
-            1 if self.batteryValues["/Info/ChargeMode"].startswith("Bulk") else 0
-        )
-        self._dbusservice["/Leds/Float"] = (
-            1 if self.batteryValues["/Info/ChargeMode"].startswith("Float") else 0
-        )
-        self._dbusservice["/Leds/Inverter"] = 1
-        self._dbusservice["/Leds/LowBattery"] = 0
-        self._dbusservice["/Leds/Mains"] = 1
-        self._dbusservice["/Leds/Overload"] = 0
-        self._dbusservice["/Leds/Temperature"] = 0
+            # increment UpdateIndex - to show that new data is available
+            index = self._dbusservice["/UpdateIndex"] + 1  # increment index
+            if index > 255:  # maximum value of the index
+                index = 0  # overflow from 255 to 0
+            self._dbusservice["/UpdateIndex"] = index
 
-        self._dbusservice["/Mode"] = 3
-        self._dbusservice["/ModeIsAdjustable"] = 1
-        self._dbusservice["/PvInverter/Disable"] = 0
-        self._dbusservice["/Quirks"] = 0
-        self._dbusservice["/RedetectSystem"] = 0
-        self._dbusservice["/Settings/Alarm/System/GridLost"] = 1
-        self._dbusservice["/Settings/SystemSetup/AcInput1"] = 1
-        self._dbusservice["/Settings/SystemSetup/AcInput2"] = 0
-        self._dbusservice["/ShortIds"] = 1
-        self._dbusservice["/Soc"] = self.batteryValues["/Soc"]
-        self._dbusservice["/State"] = 8
-        self._dbusservice["/SystemReset"] = None
-        self._dbusservice["/VebusChargeState"] = 1
-        self._dbusservice["/VebusError"] = 0
-        self._dbusservice["/VebusMainState"] = 9
+            return True
 
-        # increment UpdateIndex - to show that new data is available
-        index = self._dbusservice["/UpdateIndex"] + 1  # increment index
-        if index > 255:  # maximum value of the index
-            index = 0  # overflow from 255 to 0
-        self._dbusservice["/UpdateIndex"] = index
+        except Exception as e:
+            logging.error(f"Error in _update method: {str(e)}")
+            return True
 
-        return True
 
     def _handlechangedvalue(self, path, value):
         logging.debug("someone else updated %s to %s" % (path, value))
