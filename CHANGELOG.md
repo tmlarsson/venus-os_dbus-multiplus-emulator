@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.0.4
+* Fixed: Solar export was counted as consumption because Multi AC-In copied the grid meter and ignored PV on AC-in
+* Added: Read PV inverter position and power, and subtract battery DC power from AC-Out
+* Added: Energy counters for feed-in (`AcOutToAcIn1`) and passthrough (`AcIn1ToAcOut`)
+
 ## v0.0.3
 * Added: Energy sum of power from `Out to Inverter` and `Inverter to Out`
 * Added: LED display

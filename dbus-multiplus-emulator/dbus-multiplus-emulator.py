@@ -13,6 +13,7 @@ import json
 sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"))
 from vedbus import VeDbusService
 from dbusmonitor import DbusMonitor
+from ac_power import as_number, calculate_multi_ac_power, pv_power_on_input_and_output
 
 # Configure logging
 log_dir = os.path.dirname(os.path.realpath(__file__))
@@ -119,7 +120,7 @@ class DbusMultiPlusEmulator:
         self._dbusservice.add_path("/ProductName", productname)  # ok
         self._dbusservice.add_path("/CustomName", "")  # ok
         self._dbusservice.add_path("/FirmwareVersion", 1175)  # ok
-        self._dbusservice.add_path("/HardwareVersion", "0.0.3 (20230821)")
+        self._dbusservice.add_path("/HardwareVersion", "0.0.4 (20260907)")
         self._dbusservice.add_path("/Connected", 1)  # ok
 
         # self._dbusservice.add_path('/Latency', None)
@@ -203,7 +204,17 @@ class DbusMultiPlusEmulator:
                 }
             }
         )
-       
+        dbus_tree.update(
+            {
+                "com.victronenergy.pvinverter": {
+                    "/Position": dummy,
+                    "/Ac/L1/Power": dummy,
+                    "/Ac/L2/Power": dummy,
+                    "/Ac/L3/Power": dummy,
+                    "/Ac/Power": dummy,
+                }
+            }
+        )
 
         # create empty dictionary will be updated later
         self.gridValues = {
@@ -279,32 +290,153 @@ class DbusMultiPlusEmulator:
         pass
 
     def _device_removed(self, service, instance):
-    
         pass
+
+    def _pv_inverters(self):
+        inverters = []
+        for service in self._dbusmonitor.get_service_list("com.victronenergy.pvinverter"):
+            inverter = {
+                "position": self._dbusmonitor.get_value(service, "/Position", 0),
+            }
+            for phase in phases:
+                inverter[phase] = self._dbusmonitor.get_value(
+                    service, "/Ac/%s/Power" % phase, 0
+                )
+            inverters.append(inverter)
+        return inverters
+
+    def _accumulate_energy(self, dc_power, ac_in_total):
+        global data_watt_hours, json_data, timestamp_storage_file
+
+        timestamp = int(time())
+        dc_charging = dc_power if dc_power > 0 else 0
+        dc_discharging = -dc_power if dc_power < 0 else 0
+        ac_feed_in = -ac_in_total if ac_in_total < 0 else 0
+        ac_from_grid = ac_in_total if ac_in_total > 0 else 0
+
+        if data_watt_hours["time_creation"] + data_watt_hours_timespan > timestamp:
+            dc_sample = data_watt_hours.get("dc", {"charging": 0, "discharging": 0})
+            ac_sample = data_watt_hours.get("ac", {"feed_in": 0, "from_grid": 0})
+            data_watt_hours["dc"] = {
+                "charging": round(dc_sample.get("charging", 0) + dc_charging, 3),
+                "discharging": round(dc_sample.get("discharging", 0) + dc_discharging, 3),
+            }
+            data_watt_hours["ac"] = {
+                "feed_in": round(ac_sample.get("feed_in", 0) + ac_feed_in, 3),
+                "from_grid": round(ac_sample.get("from_grid", 0) + ac_from_grid, 3),
+            }
+            data_watt_hours["count"] = data_watt_hours.get("count", 0) + 1
+            return
+
+        if os.path.isfile(data_watt_hours_working_file):
+            with open(data_watt_hours_working_file, "r") as file:
+                data_watt_hours_old = json.load(file)
+        elif os.path.isfile(data_watt_hours_storage_file):
+            with open(data_watt_hours_storage_file, "r") as file:
+                data_watt_hours_old = json.load(file)
+        else:
+            data_watt_hours_old = {
+                "dc": {"charging": 0, "discharging": 0},
+                "ac": {"feed_in": 0, "from_grid": 0},
+            }
+
+        factor = (timestamp - data_watt_hours["time_creation"]) / 3600
+        count = data_watt_hours.get("count") or 1
+        dc_acc = data_watt_hours.get("dc", {"charging": 0, "discharging": 0})
+        ac_acc = data_watt_hours.get("ac", {"feed_in": 0, "from_grid": 0})
+        old_dc = data_watt_hours_old.get("dc", {"charging": 0, "discharging": 0})
+        old_ac = data_watt_hours_old.get("ac", {"feed_in": 0, "from_grid": 0})
+
+        json_data = {
+            "dc": {
+                "charging": round(
+                    old_dc.get("charging", 0)
+                    + (dc_acc.get("charging", 0) / count * factor) / 1000,
+                    3,
+                ),
+                "discharging": round(
+                    old_dc.get("discharging", 0)
+                    + (dc_acc.get("discharging", 0) / count * factor) / 1000,
+                    3,
+                ),
+            },
+            "ac": {
+                "feed_in": round(
+                    old_ac.get("feed_in", 0)
+                    + (ac_acc.get("feed_in", 0) / count * factor) / 1000,
+                    3,
+                ),
+                "from_grid": round(
+                    old_ac.get("from_grid", 0)
+                    + (ac_acc.get("from_grid", 0) / count * factor) / 1000,
+                    3,
+                ),
+            },
+        }
+
+        with open(data_watt_hours_working_file, "w") as file:
+            file.write(json.dumps(json_data))
+
+        if timestamp_storage_file + data_watt_hours_save < timestamp:
+            with open(data_watt_hours_storage_file, "w") as file:
+                file.write(json.dumps(json_data))
+            timestamp_storage_file = timestamp
+            logging.info(
+                "Written JSON for energy counters to persistent storage."
+            )
+
+        data_watt_hours = {
+            "time_creation": timestamp,
+            "dc": {
+                "charging": round(dc_charging, 3),
+                "discharging": round(dc_discharging, 3),
+            },
+            "ac": {
+                "feed_in": round(ac_feed_in, 3),
+                "from_grid": round(ac_from_grid, 3),
+            },
+            "count": 1,
+        }
 
     def _update(self):
         try:
-            ac_in_power = {phase: self.gridValues.get(f"/Ac/{phase}/Power", 0) for phase in phases}
-            ac_in_voltage = {phase: self.gridValues.get(f"/Ac/{phase}/Voltage", 0) for phase in phases}
+            grid_power = {
+                phase: as_number(self.gridValues.get("/Ac/%s/Power" % phase))
+                for phase in phases
+            }
+            ac_in_voltage = {
+                phase: as_number(self.gridValues.get("/Ac/%s/Voltage" % phase))
+                for phase in phases
+            }
+            pv_on_input, _pv_on_output = pv_power_on_input_and_output(
+                self._pv_inverters(), phases
+            )
+            dc_power = as_number(self.batteryValues.get("/Dc/0/Power"))
 
-            # Ac out power is always the same as the grid power as we do not have an AC in PV inverter
-            # or any battery which could be inverted to AC
-            ac_out_power = {phase: ac_in_power[phase] for phase in phases}
+            # Venus adds PV-on-output back onto Multi AC-Out, so it is omitted here.
+            # AC-In must include PV on AC-in, otherwise systemcalc treats all
+            # that production as ConsumptionOnInput (export counted as load).
+            ac_in_power, ac_out_power = calculate_multi_ac_power(
+                grid_power, pv_on_input, dc_power, phases
+            )
+            self._accumulate_energy(dc_power, sum(ac_in_power.values()))
 
             ac_in = {}
             for phase in phases:
+                voltage = ac_in_voltage[phase]
                 ac_in[phase] = {
-                    "current": round(ac_in_power[phase] / ac_in_voltage[phase], 2) if ac_in_voltage[phase] > 0 else 0,
+                    "current": round(ac_in_power[phase] / voltage, 2) if voltage > 0 else 0,
                     "power": ac_in_power[phase],
-                    "voltage": ac_in_voltage[phase],
+                    "voltage": voltage,
                 }
 
             ac_out = {}
             for phase in phases:
+                voltage = ac_in_voltage[phase]
                 ac_out[phase] = {
-                    "current": round(ac_out_power[phase] / ac_in_voltage[phase], 2) if ac_in_voltage[phase] > 0 else 0,
+                    "current": round(ac_out_power[phase] / voltage, 2) if voltage > 0 else 0,
                     "power": ac_out_power[phase],
-                    "voltage": ac_in_voltage[phase],
+                    "voltage": voltage,
                 }
 
             try:
@@ -451,6 +583,16 @@ class DbusMultiPlusEmulator:
             self._dbusservice["/Energy/OutToInverter"] = (
                 json_data["dc"]["charging"]
                 if "dc" in json_data and "charging" in json_data["dc"]
+                else 0
+            )
+            self._dbusservice["/Energy/AcOutToAcIn1"] = (
+                json_data["ac"]["feed_in"]
+                if "ac" in json_data and "feed_in" in json_data["ac"]
+                else 0
+            )
+            self._dbusservice["/Energy/AcIn1ToAcOut"] = (
+                json_data["ac"]["from_grid"]
+                if "ac" in json_data and "from_grid" in json_data["ac"]
                 else 0
             )
 
