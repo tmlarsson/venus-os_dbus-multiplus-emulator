@@ -5,7 +5,6 @@ import platform
 import logging
 import sys
 import os
-import _thread
 from time import time
 import json
 
@@ -13,20 +12,20 @@ import json
 sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"))
 from vedbus import VeDbusService
 from dbusmonitor import DbusMonitor
-from ac_power import as_number, calculate_multi_ac_power, pv_power_on_input_and_output
-
-# Configure logging
-log_dir = os.path.dirname(os.path.realpath(__file__))
-log_file = os.path.join(log_dir, "current.log")
+from ac_power import (
+    as_number,
+    calculate_multi_ac_power,
+    energy_flows,
+    multi_dc_power,
+    phase_power_or_total,
+    pv_power_on_input_and_output,
+)
 
 logging.basicConfig(
-    format='%(asctime)s,%(msecs)d %(name)s %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
+    format="%(asctime)s,%(msecs)d %(name)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
     level=logging.INFO,
-    handlers=[
-        logging.FileHandler(log_file),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()],
 )
 
 # ------------------ USER CHANGABLE VALUES | START ------------------
@@ -42,9 +41,8 @@ dbusServiceNameBattery = ""
 # e.g. com.victronenergy.grid.mqtt_grid_31
 dbusServiceNameGrid = ""
 
-# specify on which phase the AC PV Inverter is connected
-# e.g. L1, L2 or L3
-# default: L1
+# phases present on the grid meter / Multi
+# e.g. ["L1"] or ["L1", "L2", "L3"]
 phases = ["L1", "L2", "L3"]
 
 # ------------------ USER CHANGABLE VALUES | END --------------------
@@ -62,32 +60,39 @@ data_watt_hours_storage_file = "/data/etc/dbus-multiplus-emulator/data_watt_hour
 data_watt_hours_working_file = (
     "/var/volatile/tmp/dbus-multiplus-emulator_data_watt_hours.json"
 )
-# get last modification timestamp
+def _load_energy_json(path):
+    try:
+        with open(path, "r") as handle:
+            return json.load(handle)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        logging.warning("Could not load %s: %s", path, error)
+        return {}
+
+
+def _atomic_write_json(path, payload):
+    directory = os.path.dirname(path)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as handle:
+        json.dump(payload, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, path)
+
+
 timestamp_storage_file = (
     os.path.getmtime(data_watt_hours_storage_file)
     if os.path.isfile(data_watt_hours_storage_file)
     else 0
 )
 
-# load data to prevent sending 0 watthours for OutToInverter (charging)/InverterToOut (discharging) before the first loop
-# check if file in volatile storage exists
 if os.path.isfile(data_watt_hours_working_file):
-    with open(data_watt_hours_working_file, "r") as file:
-        file = open(data_watt_hours_working_file, "r")
-        json_data = json.load(file)
-        logging.info(
-            "Loaded JSON for OutToInverter (charging)/InverterToOut (discharging) once"
-        )
-        logging.debug(json.dumps(json_data))
-# if not, check if file in persistent storage exists
+    json_data = _load_energy_json(data_watt_hours_working_file)
+    logging.info("Loaded JSON energy counters from volatile storage")
 elif os.path.isfile(data_watt_hours_storage_file):
-    with open(data_watt_hours_storage_file, "r") as file:
-        file = open(data_watt_hours_storage_file, "r")
-        json_data = json.load(file)
-        logging.info(
-            "Loaded JSON for OutToInverter (charging)/InverterToOut (discharging) once from persistent storage"
-        )
-        logging.debug(json.dumps(json_data))
+    json_data = _load_energy_json(data_watt_hours_storage_file)
+    logging.info("Loaded JSON energy counters from persistent storage")
 else:
     json_data = {}
 
@@ -110,7 +115,7 @@ class DbusMultiPlusEmulator:
         self._dbusservice.add_path("/Mgmt/ProcessName", __file__)  # ok
         self._dbusservice.add_path(
             "/Mgmt/ProcessVersion",
-            "Unkown version, and running on Python " + platform.python_version(),
+            "Unknown version, and running on Python " + platform.python_version(),
         )  # ok
         self._dbusservice.add_path("/Mgmt/Connection", connection)  # ok
 
@@ -120,7 +125,7 @@ class DbusMultiPlusEmulator:
         self._dbusservice.add_path("/ProductName", productname)  # ok
         self._dbusservice.add_path("/CustomName", "")  # ok
         self._dbusservice.add_path("/FirmwareVersion", 1175)  # ok
-        self._dbusservice.add_path("/HardwareVersion", "0.0.4 (20260907)")
+        self._dbusservice.add_path("/HardwareVersion", "0.0.5 (20260907)")
         self._dbusservice.add_path("/Connected", 1)  # ok
 
         # self._dbusservice.add_path('/Latency', None)
@@ -167,19 +172,6 @@ class DbusMultiPlusEmulator:
                 }
             }
         )
-        # create empty dictionary will be updated later
-        self.batteryValues = {
-            "/Dc/0/Current": None,
-            "/Dc/0/Power": None,
-            "/Dc/0/Temperature": None,
-            "/Dc/0/Voltage": None,
-            "/Soc": None,
-            "/Info/ChargeMode": "",
-            "/Info/MaxChargeCurrent": None,
-            "/Info/MaxChargeVoltage": None,
-            "/Info/MaxDischargeCurrent": None,
-        }
-
         dbus_tree.update(
             {
                 "com.victronenergy.grid": {
@@ -215,23 +207,21 @@ class DbusMultiPlusEmulator:
                 }
             }
         )
-
-        # create empty dictionary will be updated later
-        self.gridValues = {
-            "/Ac/L1/Power": None,
-            "/Ac/L2/Power": None,
-            "/Ac/L3/Power": None,
-            "/Ac/L1/Current": None,
-            "/Ac/L2/Current": None,
-            "/Ac/L3/Current": None,
-            "/Ac/L1/Voltage": None,
-            "/Ac/L2/Voltage": None,
-            "/Ac/L3/Voltage": None,
-            # ---
-            "/Ac/Power": None,
-            "/Ac/Current": None,
-            "/Ac/Voltage": None,
-        }
+        dbus_tree.update(
+            {
+                "com.victronenergy.solarcharger": {
+                    "/Dc/0/Voltage": dummy,
+                    "/Dc/0/Current": dummy,
+                }
+            }
+        )
+        dbus_tree.update(
+            {
+                "com.victronenergy.dcsystem": {
+                    "/Dc/0/Power": dummy,
+                }
+            }
+        )
 
         """
         dbus_tree.update({
@@ -270,395 +260,302 @@ class DbusMultiPlusEmulator:
     ):
         self._changed = True
 
-        if (
-            dbusServiceNameBattery == ""
-            and dbusServiceName.startswith("com.victronenergy.battery")
-        ) or (
-            dbusServiceNameBattery != "" and dbusServiceName == dbusServiceNameBattery
-        ):
-            self.batteryValues.update({str(dbusPath): changes["Value"]})
-
-        if (
-            dbusServiceNameGrid == ""
-            and dbusServiceName.startswith("com.victronenergy.grid")
-        ) or (dbusServiceNameGrid != "" and dbusServiceName == dbusServiceNameGrid):
-            self.gridValues.update({str(dbusPath): changes["Value"]})
-            
-
     def _device_added(self, service, instance, do_service_change=True):
-
         pass
 
     def _device_removed(self, service, instance):
         pass
 
+    def _pick_service(self, class_name, configured_name=""):
+        services = self._dbusmonitor.get_service_list(class_name)
+        if configured_name:
+            return configured_name if configured_name in services else None
+        if not services:
+            return None
+        return sorted(services.items(), key=lambda item: item[1])[0][0]
+
+    def _read_grid(self):
+        service = self._pick_service("com.victronenergy.grid", dbusServiceNameGrid)
+        power = {}
+        voltage = {}
+        for phase in phases:
+            if service:
+                power[phase] = self._dbusmonitor.get_value(
+                    service, "/Ac/%s/Power" % phase
+                )
+                voltage[phase] = self._dbusmonitor.get_value(
+                    service, "/Ac/%s/Voltage" % phase
+                )
+            else:
+                power[phase] = None
+                voltage[phase] = None
+        return power, voltage
+
+    def _read_battery(self):
+        service = self._pick_service("com.victronenergy.battery", dbusServiceNameBattery)
+        paths = (
+            "/Dc/0/Current",
+            "/Dc/0/Power",
+            "/Dc/0/Temperature",
+            "/Dc/0/Voltage",
+            "/Soc",
+            "/Info/ChargeMode",
+            "/Info/MaxChargeCurrent",
+            "/Info/MaxChargeVoltage",
+            "/Info/MaxDischargeCurrent",
+        )
+        values = {}
+        for path in paths:
+            values[path] = (
+                self._dbusmonitor.get_value(service, path) if service else None
+            )
+        return values
+
+    def _mppt_power(self):
+        total = 0.0
+        for service in self._dbusmonitor.get_service_list("com.victronenergy.solarcharger"):
+            voltage = self._dbusmonitor.get_value(service, "/Dc/0/Voltage")
+            current = self._dbusmonitor.get_value(service, "/Dc/0/Current")
+            if voltage is not None and current is not None:
+                total += voltage * current
+        return total
+
+    def _dc_load_power(self):
+        total = 0.0
+        for service in self._dbusmonitor.get_service_list("com.victronenergy.dcsystem"):
+            total += as_number(self._dbusmonitor.get_value(service, "/Dc/0/Power"))
+        return total
+
     def _pv_inverters(self):
         inverters = []
         for service in self._dbusmonitor.get_service_list("com.victronenergy.pvinverter"):
-            inverter = {
-                "position": self._dbusmonitor.get_value(service, "/Position", 0),
+            phase_powers = {
+                phase: self._dbusmonitor.get_value(service, "/Ac/%s/Power" % phase)
+                for phase in phases
             }
-            for phase in phases:
-                inverter[phase] = self._dbusmonitor.get_value(
-                    service, "/Ac/%s/Power" % phase, 0
-                )
+            resolved = phase_power_or_total(
+                phase_powers,
+                self._dbusmonitor.get_value(service, "/Ac/Power"),
+                phases,
+            )
+            inverter = {"position": self._dbusmonitor.get_value(service, "/Position", 0)}
+            inverter.update(resolved)
             inverters.append(inverter)
         return inverters
 
-    def _accumulate_energy(self, dc_power, ac_in_total):
+    def _empty_energy_sample(self):
+        return {
+            "dc": {"charging": 0, "discharging": 0},
+            "ac": {
+                "ac_in1_to_ac_out": 0,
+                "ac_in1_to_inverter": 0,
+                "out_to_inverter": 0,
+                "inverter_to_ac_out": 0,
+                "ac_out_to_ac_in1": 0,
+            },
+        }
+
+    def _normalize_energy(self, payload):
+        sample = self._empty_energy_sample()
+        payload = payload or {}
+        dc = payload.get("dc") or {}
+        ac = payload.get("ac") or {}
+        sample["dc"]["charging"] = as_number(dc.get("charging"))
+        sample["dc"]["discharging"] = as_number(dc.get("discharging"))
+        sample["ac"]["ac_in1_to_ac_out"] = as_number(
+            ac.get("ac_in1_to_ac_out", ac.get("from_grid"))
+        )
+        sample["ac"]["ac_in1_to_inverter"] = as_number(ac.get("ac_in1_to_inverter"))
+        sample["ac"]["out_to_inverter"] = as_number(ac.get("out_to_inverter"))
+        sample["ac"]["inverter_to_ac_out"] = as_number(ac.get("inverter_to_ac_out"))
+        sample["ac"]["ac_out_to_ac_in1"] = as_number(
+            ac.get("ac_out_to_ac_in1", ac.get("feed_in"))
+        )
+        return sample
+
+    def _add_energy_sample(self, flows):
+        sample = self._empty_energy_sample()
+        existing = data_watt_hours if "dc" in data_watt_hours else self._empty_energy_sample()
+        sample["dc"]["charging"] = existing["dc"].get("charging", 0) + flows["charging"]
+        sample["dc"]["discharging"] = existing["dc"].get("discharging", 0) + flows["discharging"]
+        for key in sample["ac"]:
+            sample["ac"][key] = existing["ac"].get(key, 0) + flows["ac"].get(key, 0)
+        return sample
+
+    def _accumulate_energy(self, dc_power, ac_in_total, ac_out_total):
         global data_watt_hours, json_data, timestamp_storage_file
 
         timestamp = int(time())
-        dc_charging = dc_power if dc_power > 0 else 0
-        dc_discharging = -dc_power if dc_power < 0 else 0
-        ac_feed_in = -ac_in_total if ac_in_total < 0 else 0
-        ac_from_grid = ac_in_total if ac_in_total > 0 else 0
+        flows = energy_flows(ac_in_total, ac_out_total, dc_power)
+        sample_add = {
+            "charging": max(0.0, dc_power),
+            "discharging": max(0.0, -dc_power),
+            "ac": flows,
+        }
 
         if data_watt_hours["time_creation"] + data_watt_hours_timespan > timestamp:
-            dc_sample = data_watt_hours.get("dc", {"charging": 0, "discharging": 0})
-            ac_sample = data_watt_hours.get("ac", {"feed_in": 0, "from_grid": 0})
-            data_watt_hours["dc"] = {
-                "charging": round(dc_sample.get("charging", 0) + dc_charging, 3),
-                "discharging": round(dc_sample.get("discharging", 0) + dc_discharging, 3),
-            }
-            data_watt_hours["ac"] = {
-                "feed_in": round(ac_sample.get("feed_in", 0) + ac_feed_in, 3),
-                "from_grid": round(ac_sample.get("from_grid", 0) + ac_from_grid, 3),
-            }
+            added = self._add_energy_sample(sample_add)
+            data_watt_hours["dc"] = added["dc"]
+            data_watt_hours["ac"] = added["ac"]
             data_watt_hours["count"] = data_watt_hours.get("count", 0) + 1
             return
 
         if os.path.isfile(data_watt_hours_working_file):
-            with open(data_watt_hours_working_file, "r") as file:
-                data_watt_hours_old = json.load(file)
+            data_watt_hours_old = self._normalize_energy(
+                _load_energy_json(data_watt_hours_working_file)
+            )
         elif os.path.isfile(data_watt_hours_storage_file):
-            with open(data_watt_hours_storage_file, "r") as file:
-                data_watt_hours_old = json.load(file)
+            data_watt_hours_old = self._normalize_energy(
+                _load_energy_json(data_watt_hours_storage_file)
+            )
         else:
-            data_watt_hours_old = {
-                "dc": {"charging": 0, "discharging": 0},
-                "ac": {"feed_in": 0, "from_grid": 0},
-            }
+            data_watt_hours_old = self._empty_energy_sample()
 
         factor = (timestamp - data_watt_hours["time_creation"]) / 3600
         count = data_watt_hours.get("count") or 1
-        dc_acc = data_watt_hours.get("dc", {"charging": 0, "discharging": 0})
-        ac_acc = data_watt_hours.get("ac", {"feed_in": 0, "from_grid": 0})
-        old_dc = data_watt_hours_old.get("dc", {"charging": 0, "discharging": 0})
-        old_ac = data_watt_hours_old.get("ac", {"feed_in": 0, "from_grid": 0})
+        acc = self._normalize_energy(data_watt_hours)
 
-        json_data = {
-            "dc": {
-                "charging": round(
-                    old_dc.get("charging", 0)
-                    + (dc_acc.get("charging", 0) / count * factor) / 1000,
-                    3,
-                ),
-                "discharging": round(
-                    old_dc.get("discharging", 0)
-                    + (dc_acc.get("discharging", 0) / count * factor) / 1000,
-                    3,
-                ),
-            },
-            "ac": {
-                "feed_in": round(
-                    old_ac.get("feed_in", 0)
-                    + (ac_acc.get("feed_in", 0) / count * factor) / 1000,
-                    3,
-                ),
-                "from_grid": round(
-                    old_ac.get("from_grid", 0)
-                    + (ac_acc.get("from_grid", 0) / count * factor) / 1000,
-                    3,
-                ),
-            },
-        }
-
-        with open(data_watt_hours_working_file, "w") as file:
-            file.write(json.dumps(json_data))
-
-        if timestamp_storage_file + data_watt_hours_save < timestamp:
-            with open(data_watt_hours_storage_file, "w") as file:
-                file.write(json.dumps(json_data))
-            timestamp_storage_file = timestamp
-            logging.info(
-                "Written JSON for energy counters to persistent storage."
+        json_data = {"dc": {}, "ac": {}}
+        for key in ("charging", "discharging"):
+            json_data["dc"][key] = round(
+                data_watt_hours_old["dc"][key]
+                + (acc["dc"][key] / count * factor) / 1000,
+                3,
             )
+        for key in acc["ac"]:
+            json_data["ac"][key] = round(
+                data_watt_hours_old["ac"][key]
+                + (acc["ac"][key] / count * factor) / 1000,
+                3,
+            )
+
+        try:
+            _atomic_write_json(data_watt_hours_working_file, json_data)
+            if timestamp_storage_file + data_watt_hours_save < timestamp:
+                _atomic_write_json(data_watt_hours_storage_file, json_data)
+                timestamp_storage_file = timestamp
+                logging.info("Written JSON for energy counters to persistent storage.")
+        except OSError as error:
+            logging.warning("Could not persist energy counters: %s", error)
+            data_watt_hours["time_creation"] = timestamp
+            data_watt_hours["count"] = 0
+            return
 
         data_watt_hours = {
             "time_creation": timestamp,
             "dc": {
-                "charging": round(dc_charging, 3),
-                "discharging": round(dc_discharging, 3),
+                "charging": round(sample_add["charging"], 3),
+                "discharging": round(sample_add["discharging"], 3),
             },
-            "ac": {
-                "feed_in": round(ac_feed_in, 3),
-                "from_grid": round(ac_from_grid, 3),
-            },
+            "ac": {key: round(value, 3) for key, value in flows.items()},
             "count": 1,
         }
 
+    def _phase_vi(self, power, voltage):
+        if power is None and voltage is None:
+            return {"current": None, "power": None, "voltage": None}
+        voltage = as_number(voltage)
+        power = as_number(power)
+        current = round(power / voltage, 2) if voltage > 0 else 0
+        return {"current": current, "power": power, "voltage": voltage}
+
+    def _battery_voltage(self, battery):
+        voltage = battery.get("/Dc/0/Voltage")
+        if voltage is not None:
+            return voltage
+        power = battery.get("/Dc/0/Power")
+        current = battery.get("/Dc/0/Current")
+        if power is None or current in (None, 0):
+            return None
+        try:
+            return round(power / current, 2)
+        except (TypeError, ZeroDivisionError):
+            return None
+
     def _update(self):
         try:
-            grid_power = {
-                phase: as_number(self.gridValues.get("/Ac/%s/Power" % phase))
-                for phase in phases
-            }
-            ac_in_voltage = {
-                phase: as_number(self.gridValues.get("/Ac/%s/Voltage" % phase))
-                for phase in phases
-            }
+            grid_power, grid_voltage = self._read_grid()
+            battery = self._read_battery()
             pv_on_input, _pv_on_output = pv_power_on_input_and_output(
                 self._pv_inverters(), phases
             )
-            dc_power = as_number(self.batteryValues.get("/Dc/0/Power"))
-
-            # Venus adds PV-on-output back onto Multi AC-Out, so it is omitted here.
-            # AC-In must include PV on AC-in, otherwise systemcalc treats all
-            # that production as ConsumptionOnInput (export counted as load).
+            dc_power = multi_dc_power(
+                battery.get("/Dc/0/Power"),
+                self._mppt_power(),
+                self._dc_load_power(),
+            )
             ac_in_power, ac_out_power = calculate_multi_ac_power(
                 grid_power, pv_on_input, dc_power, phases
             )
-            self._accumulate_energy(dc_power, sum(ac_in_power.values()))
+            self._accumulate_energy(
+                dc_power, sum(ac_in_power.values()), sum(ac_out_power.values())
+            )
 
-            ac_in = {}
+            ac_in = {
+                phase: self._phase_vi(ac_in_power[phase], grid_voltage[phase])
+                for phase in phases
+            }
+            ac_out = {
+                phase: self._phase_vi(ac_out_power[phase], grid_voltage[phase])
+                for phase in phases
+            }
+
+            self._dbusservice["/Ac/NumberOfPhases"] = len(phases)
             for phase in phases:
-                voltage = ac_in_voltage[phase]
-                ac_in[phase] = {
-                    "current": round(ac_in_power[phase] / voltage, 2) if voltage > 0 else 0,
-                    "power": ac_in_power[phase],
-                    "voltage": voltage,
-                }
+                self._dbusservice["/Ac/ActiveIn/%s/F" % phase] = grid_frequency
+                self._dbusservice["/Ac/ActiveIn/%s/I" % phase] = ac_in[phase]["current"]
+                self._dbusservice["/Ac/ActiveIn/%s/P" % phase] = ac_in[phase]["power"]
+                self._dbusservice["/Ac/ActiveIn/%s/S" % phase] = ac_in[phase]["power"]
+                self._dbusservice["/Ac/ActiveIn/%s/V" % phase] = ac_in[phase]["voltage"]
+                self._dbusservice["/Ac/Out/%s/F" % phase] = grid_frequency
+                self._dbusservice["/Ac/Out/%s/I" % phase] = ac_out[phase]["current"]
+                self._dbusservice["/Ac/Out/%s/P" % phase] = ac_out[phase]["power"]
+                self._dbusservice["/Ac/Out/%s/S" % phase] = ac_out[phase]["power"]
+                self._dbusservice["/Ac/Out/%s/V" % phase] = ac_out[phase]["voltage"]
 
-            ac_out = {}
-            for phase in phases:
-                voltage = ac_in_voltage[phase]
-                ac_out[phase] = {
-                    "current": round(ac_out_power[phase] / voltage, 2) if voltage > 0 else 0,
-                    "power": ac_out_power[phase],
-                    "voltage": voltage,
-                }
-
-            try:
-                self._dbusservice["/Ac/ActiveIn/ActiveInput"] = 0
-                self._dbusservice["/Ac/ActiveIn/Connected"] = 1
-                self._dbusservice["/Ac/ActiveIn/CurrentLimit"] = 16
-                self._dbusservice["/Ac/ActiveIn/CurrentLimitIsAdjustable"] = 1
-                self._dbusservice["/Ac/NumberOfAcInputs"] = 1
-                self._dbusservice["/Ac/NumberOfPhases"] = 3
-                self._dbusservice["/Ac/Out/NominalInverterPower"] = 4500
-            except Exception as e:
-                logging.error("Error updating dbus values: %s" % str(e))
-
-            for phase in phases:
-                self._dbusservice[f"/Ac/ActiveIn/{phase}/F"] = grid_frequency
-                self._dbusservice[f"/Ac/ActiveIn/{phase}/I"] = ac_in[phase]["current"]
-                self._dbusservice[f"/Ac/ActiveIn/{phase}/P"] = ac_in[phase]["power"]
-                self._dbusservice[f"/Ac/ActiveIn/{phase}/S"] = ac_in[phase]["power"]
-                self._dbusservice[f"/Ac/ActiveIn/{phase}/V"] = ac_in[phase]["voltage"]
-
-                self._dbusservice[f"/Ac/Out/{phase}/F"] = grid_frequency
-                self._dbusservice[f"/Ac/Out/{phase}/I"] = ac_out[phase]["current"]
-                self._dbusservice[f"/Ac/Out/{phase}/NominalInverterPower"] = 4500
-                self._dbusservice[f"/Ac/Out/{phase}/P"] = ac_out[phase]["power"]
-                self._dbusservice[f"/Ac/Out/{phase}/S"] = ac_out[phase]["power"]
-                self._dbusservice[f"/Ac/Out/{phase}/V"] = ac_out[phase]["voltage"]
-
-            # Overall values
             self._dbusservice["/Ac/ActiveIn/P"] = sum(ac_in_power.values())
             self._dbusservice["/Ac/ActiveIn/S"] = sum(ac_in_power.values())
             self._dbusservice["/Ac/Out/P"] = sum(ac_out_power.values())
             self._dbusservice["/Ac/Out/S"] = sum(ac_out_power.values())
 
-            self._dbusservice["/Ac/PowerMeasurementType"] = 4
-            self._dbusservice["/Ac/State/IgnoreAcIn1"] = 0
-            self._dbusservice["/Ac/State/SplitPhaseL2Passthru"] = None
-
-            self._dbusservice["/Alarms/HighDcCurrent"] = 0
-            self._dbusservice["/Alarms/HighDcVoltage"] = 0
-            self._dbusservice["/Alarms/HighTemperature"] = 0
-            self._dbusservice["/Alarms/L1/HighTemperature"] = 0
-            self._dbusservice["/Alarms/L1/LowBattery"] = 0
-            self._dbusservice["/Alarms/L1/Overload"] = 0
-            self._dbusservice["/Alarms/L1/Ripple"] = 0
-            self._dbusservice["/Alarms/L2/HighTemperature"] = 0
-            self._dbusservice["/Alarms/L2/LowBattery"] = 0
-            self._dbusservice["/Alarms/L2/Overload"] = 0
-            self._dbusservice["/Alarms/L2/Ripple"] = 0
-            self._dbusservice["/Alarms/L3/HighTemperature"] = 0
-            self._dbusservice["/Alarms/L3/LowBattery"] = 0
-            self._dbusservice["/Alarms/L3/Overload"] = 0
-            self._dbusservice["/Alarms/L3/Ripple"] = 0
-            self._dbusservice["/Alarms/LowBattery"] = 0
-            self._dbusservice["/Alarms/Overload"] = 0
-            self._dbusservice["/Alarms/PhaseRotation"] = 0
-            self._dbusservice["/Alarms/Ripple"] = 0
-            self._dbusservice["/Alarms/TemperatureSensor"] = 0
-            self._dbusservice["/Alarms/VoltageSensor"] = 0
-
-            self._dbusservice["/BatteryOperationalLimits/BatteryLowVoltage"] = None
-            self._dbusservice[
-                "/BatteryOperationalLimits/MaxChargeCurrent"
-            ] = self.batteryValues["/Info/MaxChargeCurrent"]
-            self._dbusservice[
-                "/BatteryOperationalLimits/MaxChargeVoltage"
-            ] = self.batteryValues["/Info/MaxChargeVoltage"]
-            self._dbusservice[
-                "/BatteryOperationalLimits/MaxDischargeCurrent"
-            ] = self.batteryValues["/Info/MaxDischargeCurrent"]
-            self._dbusservice["/BatterySense/Temperature"] = None
-            self._dbusservice["/BatterySense/Voltage"] = None
-
-            self._dbusservice["/Bms/AllowToCharge"] = 1
-            self._dbusservice["/Bms/AllowToChargeRate"] = 0
-            self._dbusservice["/Bms/AllowToDischarge"] = 1
-            self._dbusservice["/Bms/BmsExpected"] = 0
-            self._dbusservice["/Bms/BmsType"] = 0
-            self._dbusservice["/Bms/Error"] = 0
-            self._dbusservice["/Bms/PreAlarm"] = None
-
-            # get values from BMS
-            # for bubble flow in GUI
-            self._dbusservice["/Dc/0/Current"] = self.batteryValues["/Dc/0/Current"]
-            self._dbusservice["/Dc/0/MaxChargeCurrent"] = self.batteryValues[
+            self._dbusservice["/BatteryOperationalLimits/MaxChargeCurrent"] = battery[
                 "/Info/MaxChargeCurrent"
             ]
-            self._dbusservice["/Dc/0/Power"] = self.batteryValues["/Dc/0/Power"]
-            self._dbusservice["/Dc/0/Temperature"] = self.batteryValues["/Dc/0/Temperature"]
-            self._dbusservice["/Dc/0/Voltage"] = (
-                self.batteryValues["/Dc/0/Voltage"]
-                if self.batteryValues["/Dc/0/Voltage"] is not None
-                else round(
-                    self.batteryValues["/Dc/0/Power"] / self.batteryValues["/Dc/0/Current"],
-                    2,
-                )
-                if self.batteryValues["/Dc/0/Power"] is not None
-                and self.batteryValues["/Dc/0/Current"] is not None
-                else None
-            )
+            self._dbusservice["/BatteryOperationalLimits/MaxChargeVoltage"] = battery[
+                "/Info/MaxChargeVoltage"
+            ]
+            self._dbusservice["/BatteryOperationalLimits/MaxDischargeCurrent"] = battery[
+                "/Info/MaxDischargeCurrent"
+            ]
 
-            self._dbusservice["/Devices/0/ExtendStatus/ChargeDisabledDueToLowTemp"] = 0
-            self._dbusservice["/Devices/0/ExtendStatus/ChargeIsDisabled"] = None
-            self._dbusservice["/Devices/0/ExtendStatus/GridRelayReport/Code"] = None
-            self._dbusservice["/Devices/0/ExtendStatus/GridRelayReport/Count"] = 0
-            self._dbusservice["/Devices/0/ExtendStatus/GridRelayReport/Reset"] = 0
-            self._dbusservice["/Devices/0/ExtendStatus/HighDcCurrent"] = 0
-            self._dbusservice["/Devices/0/ExtendStatus/HighDcVoltage"] = 0
-            self._dbusservice["/Devices/0/ExtendStatus/IgnoreAcIn1"] = 0
-            self._dbusservice["/Devices/0/ExtendStatus/MainsPllLocked"] = 1
-            self._dbusservice["/Devices/0/ExtendStatus/PcvPotmeterOnZero"] = 0
-            self._dbusservice["/Devices/0/ExtendStatus/PowerPackPreOverload"] = 0
-            self._dbusservice["/Devices/0/ExtendStatus/SocTooLowToInvert"] = 0
-            self._dbusservice["/Devices/0/ExtendStatus/SustainMode"] = 0
-            self._dbusservice["/Devices/0/ExtendStatus/SwitchoverInfo/Connecting"] = 0
-            self._dbusservice["/Devices/0/ExtendStatus/SwitchoverInfo/Delay"] = 0
-            self._dbusservice["/Devices/0/ExtendStatus/SwitchoverInfo/ErrorFlags"] = 0
-            self._dbusservice["/Devices/0/ExtendStatus/TemperatureHighForceBypass"] = 0
-            self._dbusservice["/Devices/0/ExtendStatus/VeBusNetworkQualityCounter"] = 0
-            self._dbusservice["/Devices/0/ExtendStatus/WaitingForRelayTest"] = 0
+            self._dbusservice["/Dc/0/Current"] = battery["/Dc/0/Current"]
+            self._dbusservice["/Dc/0/MaxChargeCurrent"] = battery["/Info/MaxChargeCurrent"]
+            self._dbusservice["/Dc/0/Power"] = battery["/Dc/0/Power"]
+            self._dbusservice["/Dc/0/Temperature"] = battery["/Dc/0/Temperature"]
+            self._dbusservice["/Dc/0/Voltage"] = self._battery_voltage(battery)
 
-            self._dbusservice["/Devices/0/InterfaceProtectionLog/0/ErrorFlags"] = None
-            self._dbusservice["/Devices/0/InterfaceProtectionLog/0/Time"] = None
-            self._dbusservice["/Devices/0/InterfaceProtectionLog/1/ErrorFlags"] = None
-            self._dbusservice["/Devices/0/InterfaceProtectionLog/1/Time"] = None
-            self._dbusservice["/Devices/0/InterfaceProtectionLog/2/ErrorFlags"] = None
-            self._dbusservice["/Devices/0/InterfaceProtectionLog/2/Time"] = None
-            self._dbusservice["/Devices/0/InterfaceProtectionLog/3/ErrorFlags"] = None
-            self._dbusservice["/Devices/0/InterfaceProtectionLog/3/Time"] = None
-            self._dbusservice["/Devices/0/InterfaceProtectionLog/4/ErrorFlags"] = None
-            self._dbusservice["/Devices/0/InterfaceProtectionLog/4/Time"] = None
+            energy = self._normalize_energy(json_data)
+            self._dbusservice["/Energy/AcIn1ToAcOut"] = energy["ac"]["ac_in1_to_ac_out"]
+            self._dbusservice["/Energy/AcIn1ToInverter"] = energy["ac"]["ac_in1_to_inverter"]
+            self._dbusservice["/Energy/AcOutToAcIn1"] = energy["ac"]["ac_out_to_ac_in1"]
+            self._dbusservice["/Energy/InverterToAcOut"] = energy["ac"]["inverter_to_ac_out"]
+            self._dbusservice["/Energy/OutToInverter"] = energy["ac"]["out_to_inverter"]
 
-            self._dbusservice["/Devices/0/SerialNumber"] = "HQ00000AA01"
-            self._dbusservice["/Devices/0/Version"] = 2623497
+            charge_mode = battery.get("/Info/ChargeMode")
+            if not isinstance(charge_mode, str):
+                charge_mode = ""
+            self._dbusservice["/Leds/Absorption"] = int(charge_mode.startswith("Absorption"))
+            self._dbusservice["/Leds/Bulk"] = int(charge_mode.startswith("Bulk"))
+            self._dbusservice["/Leds/Float"] = int(charge_mode.startswith("Float"))
+            self._dbusservice["/Soc"] = battery["/Soc"]
 
-            self._dbusservice["/Devices/Bms/Version"] = None
-            self._dbusservice["/Devices/Dmc/Version"] = None
-            self._dbusservice["/Devices/NumberOfMultis"] = 1
-
-            self._dbusservice["/Energy/InverterToAcOut"] = (
-                json_data["dc"]["discharging"]
-                if "dc" in json_data and "discharging" in json_data["dc"]
-                else 0
-            )
-            self._dbusservice["/Energy/OutToInverter"] = (
-                json_data["dc"]["charging"]
-                if "dc" in json_data and "charging" in json_data["dc"]
-                else 0
-            )
-            self._dbusservice["/Energy/AcOutToAcIn1"] = (
-                json_data["ac"]["feed_in"]
-                if "ac" in json_data and "feed_in" in json_data["ac"]
-                else 0
-            )
-            self._dbusservice["/Energy/AcIn1ToAcOut"] = (
-                json_data["ac"]["from_grid"]
-                if "ac" in json_data and "from_grid" in json_data["ac"]
-                else 0
-            )
-
-            self._dbusservice["/FirmwareFeatures/BolFrame"] = 1
-            self._dbusservice["/FirmwareFeatures/BolUBatAndTBatSense"] = 1
-            self._dbusservice["/FirmwareFeatures/CommandWriteViaId"] = 1
-            self._dbusservice["/FirmwareFeatures/IBatSOCBroadcast"] = 1
-            self._dbusservice["/FirmwareFeatures/NewPanelFrame"] = 1
-            self._dbusservice["/FirmwareFeatures/SetChargeState"] = 1
-            self._dbusservice["/FirmwareSubVersion"] = 0
-
-            self._dbusservice["/Hub/ChargeVoltage"] = 55.2
-            self._dbusservice["/Hub4/AssistantId"] = 5
-            self._dbusservice["/Hub4/DisableCharge"] = 0
-            self._dbusservice["/Hub4/DisableFeedIn"] = 0
-            self._dbusservice["/Hub4/DoNotFeedInOvervoltage"] = 1
-            self._dbusservice["/Hub4/FixSolarOffsetTo100mV"] = 1
-            self._dbusservice["/Hub4/L1/AcPowerSetpoint"] = 0
-            self._dbusservice["/Hub4/L1/CurrentLimitedDueToHighTemp"] = 0
-            self._dbusservice["/Hub4/L1/FrequencyVariationOccurred"] = 0
-            self._dbusservice["/Hub4/L1/MaxFeedInPower"] = 32766
-            self._dbusservice["/Hub4/L1/OffsetAddedToVoltageSetpoint"] = 0
-            self._dbusservice["/Hub4/Sustain"] = 0
-            self._dbusservice["/Hub4/TargetPowerIsMaxFeedIn"] = 0
-
-            self._dbusservice["/Leds/Absorption"] = (
-                1 if self.batteryValues["/Info/ChargeMode"].startswith("Absorption") else 0
-            )
-            self._dbusservice["/Leds/Bulk"] = (
-                1 if self.batteryValues["/Info/ChargeMode"].startswith("Bulk") else 0
-            )
-            self._dbusservice["/Leds/Float"] = (
-                1 if self.batteryValues["/Info/ChargeMode"].startswith("Float") else 0
-            )
-            self._dbusservice["/Leds/Inverter"] = 1
-            self._dbusservice["/Leds/LowBattery"] = 0
-            self._dbusservice["/Leds/Mains"] = 1
-            self._dbusservice["/Leds/Overload"] = 0
-            self._dbusservice["/Leds/Temperature"] = 0
-
-            self._dbusservice["/Mode"] = 3
-            self._dbusservice["/ModeIsAdjustable"] = 1
-            self._dbusservice["/PvInverter/Disable"] = 0
-            self._dbusservice["/Quirks"] = 0
-            self._dbusservice["/RedetectSystem"] = 0
-            self._dbusservice["/Settings/Alarm/System/GridLost"] = 1
-            self._dbusservice["/Settings/SystemSetup/AcInput1"] = 1
-            self._dbusservice["/Settings/SystemSetup/AcInput2"] = 0
-            self._dbusservice["/ShortIds"] = 1
-            self._dbusservice["/Soc"] = self.batteryValues["/Soc"]
-            self._dbusservice["/State"] = 8
-            self._dbusservice["/SystemReset"] = None
-            self._dbusservice["/VebusChargeState"] = 1
-            self._dbusservice["/VebusError"] = 0
-            self._dbusservice["/VebusMainState"] = 9
-
-            # increment UpdateIndex - to show that new data is available
-            index = self._dbusservice["/UpdateIndex"] + 1  # increment index
-            if index > 255:  # maximum value of the index
-                index = 0  # overflow from 255 to 0
+            index = self._dbusservice["/UpdateIndex"] + 1
+            if index > 255:
+                index = 0
             self._dbusservice["/UpdateIndex"] = index
-
             return True
-
-        except Exception as e:
-            logging.error(f"Error in _update method: {str(e)}")
+        except Exception:
+            logging.exception("Error in _update method")
             return True
 
 
@@ -668,8 +565,6 @@ class DbusMultiPlusEmulator:
 
 
 def main():
-    _thread.daemon = True  # allow the program to quit
-
     from dbus.mainloop.glib import DBusGMainLoop
 
     # Have a mainloop, so we can send/receive asynchronous calls to and from dbus
@@ -677,6 +572,8 @@ def main():
 
     # formatting
     def _kwh(p, v):
+        if v is None:
+            return ""
         return str("%.2f" % v) + "kWh"
 
     def _a(p, v):
@@ -740,25 +637,25 @@ def main():
         "/Ac/In/2/CurrentLimitIsAdjustable": {"initial": None, "textformat": _n},
         # ----
         "/Ac/NumberOfAcInputs": {"initial": 1, "textformat": _n},
-        "/Ac/NumberOfPhases": {"initial": 1, "textformat": _n},
+        "/Ac/NumberOfPhases": {"initial": len(phases), "textformat": _n},
         # ----
         "/Ac/Out/L1/F": {"initial": None, "textformat": _hz},
         "/Ac/Out/L1/I": {"initial": None, "textformat": _a},
-        "/Ac/Out/L1/NominalInverterPower": {"initial": None, "textformat": _w},
+        "/Ac/Out/L1/NominalInverterPower": {"initial": 4500, "textformat": _w},
         "/Ac/Out/L1/P": {"initial": None, "textformat": _w},
         "/Ac/Out/L1/S": {"initial": None, "textformat": _va},
         "/Ac/Out/L1/V": {"initial": None, "textformat": _v},
         # ----
         "/Ac/Out/L2/F": {"initial": None, "textformat": _hz},
         "/Ac/Out/L2/I": {"initial": None, "textformat": _a},
-        "/Ac/Out/L2/NominalInverterPower": {"initial": None, "textformat": _w},
+        "/Ac/Out/L2/NominalInverterPower": {"initial": 4500, "textformat": _w},
         "/Ac/Out/L2/P": {"initial": None, "textformat": _w},
         "/Ac/Out/L2/S": {"initial": None, "textformat": _va},
         "/Ac/Out/L2/V": {"initial": None, "textformat": _v},
         # ----
         "/Ac/Out/L3/F": {"initial": None, "textformat": _hz},
         "/Ac/Out/L3/I": {"initial": None, "textformat": _a},
-        "/Ac/Out/L3/NominalInverterPower": {"initial": None, "textformat": _w},
+        "/Ac/Out/L3/NominalInverterPower": {"initial": 4500, "textformat": _w},
         "/Ac/Out/L3/P": {"initial": None, "textformat": _w},
         "/Ac/Out/L3/S": {"initial": None, "textformat": _va},
         "/Ac/Out/L3/V": {"initial": None, "textformat": _v},
@@ -911,16 +808,16 @@ def main():
         "/Devices/Dmc/Version": {"initial": None, "textformat": _s},
         "/Devices/NumberOfMultis": {"initial": 1, "textformat": _n},
         # ----
-        "/Energy/AcIn1ToAcOut": {"initial": 0, "textformat": _n},
-        "/Energy/AcIn1ToInverter": {"initial": 0, "textformat": _n},
-        "/Energy/AcIn2ToAcOut": {"initial": 0, "textformat": _n},
-        "/Energy/AcIn2ToInverter": {"initial": 0, "textformat": _n},
-        "/Energy/AcOutToAcIn1": {"initial": 0, "textformat": _n},
-        "/Energy/AcOutToAcIn2": {"initial": 0, "textformat": _n},
-        "/Energy/InverterToAcIn1": {"initial": 0, "textformat": _n},
-        "/Energy/InverterToAcIn2": {"initial": 0, "textformat": _n},
-        "/Energy/InverterToAcOut": {"initial": 0, "textformat": _n},
-        "/Energy/OutToInverter": {"initial": 0, "textformat": _n},
+        "/Energy/AcIn1ToAcOut": {"initial": 0, "textformat": _kwh},
+        "/Energy/AcIn1ToInverter": {"initial": 0, "textformat": _kwh},
+        "/Energy/AcIn2ToAcOut": {"initial": 0, "textformat": _kwh},
+        "/Energy/AcIn2ToInverter": {"initial": 0, "textformat": _kwh},
+        "/Energy/AcOutToAcIn1": {"initial": 0, "textformat": _kwh},
+        "/Energy/AcOutToAcIn2": {"initial": 0, "textformat": _kwh},
+        "/Energy/InverterToAcIn1": {"initial": 0, "textformat": _kwh},
+        "/Energy/InverterToAcIn2": {"initial": 0, "textformat": _kwh},
+        "/Energy/InverterToAcOut": {"initial": 0, "textformat": _kwh},
+        "/Energy/OutToInverter": {"initial": 0, "textformat": _kwh},
         "/ExtraBatteryCurrent": {"initial": 0, "textformat": _n},
         # ----
         "/FirmwareFeatures/BolFrame": {"initial": 1, "textformat": _n},
@@ -970,7 +867,7 @@ def main():
         "/Settings/SystemSetup/AcInput2": {"initial": 0, "textformat": _n},
         "/ShortIds": {"initial": 1, "textformat": _n},
         "/Soc": {"initial": None, "textformat": _percent},
-        "/State": {"initial": 3, "textformat": _n},
+        "/State": {"initial": 8, "textformat": _n},
         "/SystemReset": {"initial": None, "textformat": _n},
         "/VebusChargeState": {"initial": 1, "textformat": _n},
         "/VebusError": {"initial": 0, "textformat": _n},

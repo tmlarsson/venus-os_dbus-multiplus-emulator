@@ -50,8 +50,14 @@ Run `/data/etc/dbus-multiplus-emulator/uninstall.sh`
 
 ### Restart
 
-Run `/data/etc/dbus-multiplus-emulator/restart.sh`
+Run `/data/etc/dbus-multiplus-emulator/restart.sh` (uses `svc -t` on Venus OS).
 
 ### Debugging
 
-The logs can be checked with `tail -n 100 -f /data/log/dbus-multiplus-emulator/current | tai64nlocal`
+The logs can be checked with:
+
+```bash
+tail -n 100 -f /data/log/dbus-multiplus-emulator/current | tai64nlocal
+```
+
+If that path is empty, try `/var/log/dbus-multiplus-emulator/current`.
