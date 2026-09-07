@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.0.5
+* Changed: Only publish live AC/DC/energy/SoC values every second; static Multi paths stay at their initial values
+* Changed: PV `/Ac/Power` is used when per-phase powers are missing; PV on AC-in 2 is not folded into AC-in 1
+* Changed: `/Energy/*` paths use kWh text format
+* Changed: `install.sh` / `restart.sh` / `uninstall.sh` / `service/run` use `ln -sfn`, `svc -t`, and `python3 -u`
+* Changed: Grid and battery are read with `get_value()` every tick (no longer change-only caches)
+* Changed: Multi DC is `battery - MPPT + DC loads` so MPPT charge is not treated as Multi AC-out
+* Changed: DC is spread by `|AC-In|` so mixed-sign phases cannot explode
+* Changed: Energy counters split passthrough, AC-in-to-inverter, out-to-inverter, and feed-in
+* Fixed: Corrupt energy JSON no longer restart-loops the service; writes are atomic
+* Fixed: `ChargeMode` and `Power/Current==0` no longer abort the rest of `_update()`
+* Fixed: `/Ac/NumberOfPhases` follows the configured `phases` list
+* Fixed: v0.0.4 energy JSON keeps inverter kWh after the key rename
+* Fixed: failed `/data` persist no longer double-counts the last energy window
+* Fixed: MQTT grid `/Ac/Power` and MPPT `/Dc/0/Power` or `/Yield/Power` are used when phase/current paths are missing
+* Fixed: `/PvInverter/Disable` initial value is 0 so ESS does not treat PV as disabled
+* Fixed: Corrupt or empty volatile energy JSON falls back to persistent storage
+
 ## v0.0.4
 * Fixed: Solar export was counted as consumption because Multi AC-In copied the grid meter and ignored PV on AC-in
 * Added: Read PV inverter position and power, and subtract battery DC power from AC-Out

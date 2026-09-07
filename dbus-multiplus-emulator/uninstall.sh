@@ -3,12 +3,14 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 SERVICE_NAME=$(basename $SCRIPT_DIR)
 
 sed -i "/$SERVICE_NAME/d" /data/rc.local
-rm /service/$SERVICE_NAME
-kill $(pgrep -f "supervise $SERVICE_NAME")
+if command -v svc >/dev/null 2>&1; then
+    svc -d /service/$SERVICE_NAME 2>/dev/null || true
+else
+    pids=$(pgrep -f "python.*$SCRIPT_DIR/$SERVICE_NAME.py" || true)
+    [ -n "$pids" ] && kill $pids
+fi
+rm -f /service/$SERVICE_NAME
 
-$SCRIPT_DIR/restart.sh
-
-# remove settings
 echo "Do you want to remove the dbus entries added by this driver? (y/N)"
 read -r confirm
 if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
