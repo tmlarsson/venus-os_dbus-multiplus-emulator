@@ -15,8 +15,10 @@ from dbusmonitor import DbusMonitor
 from ac_power import (
     as_number,
     calculate_multi_ac_power,
+    charger_power,
     energy_flows,
     multi_dc_power,
+    normalize_energy,
     phase_power_or_total,
     pv_power_on_input_and_output,
 )
@@ -60,6 +62,8 @@ data_watt_hours_storage_file = "/data/etc/dbus-multiplus-emulator/data_watt_hour
 data_watt_hours_working_file = (
     "/var/volatile/tmp/dbus-multiplus-emulator_data_watt_hours.json"
 )
+
+
 def _load_energy_json(path):
     try:
         with open(path, "r") as handle:
@@ -212,6 +216,8 @@ class DbusMultiPlusEmulator:
                 "com.victronenergy.solarcharger": {
                     "/Dc/0/Voltage": dummy,
                     "/Dc/0/Current": dummy,
+                    "/Dc/0/Power": dummy,
+                    "/Yield/Power": dummy,
                 }
             }
         )
@@ -276,20 +282,23 @@ class DbusMultiPlusEmulator:
 
     def _read_grid(self):
         service = self._pick_service("com.victronenergy.grid", dbusServiceNameGrid)
-        power = {}
+        phase_powers = {}
         voltage = {}
         for phase in phases:
             if service:
-                power[phase] = self._dbusmonitor.get_value(
+                phase_powers[phase] = self._dbusmonitor.get_value(
                     service, "/Ac/%s/Power" % phase
                 )
                 voltage[phase] = self._dbusmonitor.get_value(
                     service, "/Ac/%s/Voltage" % phase
                 )
             else:
-                power[phase] = None
+                phase_powers[phase] = None
                 voltage[phase] = None
-        return power, voltage
+        total = (
+            self._dbusmonitor.get_value(service, "/Ac/Power") if service else None
+        )
+        return phase_power_or_total(phase_powers, total, phases), voltage
 
     def _read_battery(self):
         service = self._pick_service("com.victronenergy.battery", dbusServiceNameBattery)
@@ -314,10 +323,12 @@ class DbusMultiPlusEmulator:
     def _mppt_power(self):
         total = 0.0
         for service in self._dbusmonitor.get_service_list("com.victronenergy.solarcharger"):
-            voltage = self._dbusmonitor.get_value(service, "/Dc/0/Voltage")
-            current = self._dbusmonitor.get_value(service, "/Dc/0/Current")
-            if voltage is not None and current is not None:
-                total += voltage * current
+            total += charger_power(
+                self._dbusmonitor.get_value(service, "/Dc/0/Voltage"),
+                self._dbusmonitor.get_value(service, "/Dc/0/Current"),
+                self._dbusmonitor.get_value(service, "/Dc/0/Power"),
+                self._dbusmonitor.get_value(service, "/Yield/Power"),
+            )
         return total
 
     def _dc_load_power(self):
@@ -356,30 +367,15 @@ class DbusMultiPlusEmulator:
         }
 
     def _normalize_energy(self, payload):
-        sample = self._empty_energy_sample()
-        payload = payload or {}
-        dc = payload.get("dc") or {}
-        ac = payload.get("ac") or {}
-        sample["dc"]["charging"] = as_number(dc.get("charging"))
-        sample["dc"]["discharging"] = as_number(dc.get("discharging"))
-        sample["ac"]["ac_in1_to_ac_out"] = as_number(
-            ac.get("ac_in1_to_ac_out", ac.get("from_grid"))
-        )
-        sample["ac"]["ac_in1_to_inverter"] = as_number(ac.get("ac_in1_to_inverter"))
-        sample["ac"]["out_to_inverter"] = as_number(ac.get("out_to_inverter"))
-        sample["ac"]["inverter_to_ac_out"] = as_number(ac.get("inverter_to_ac_out"))
-        sample["ac"]["ac_out_to_ac_in1"] = as_number(
-            ac.get("ac_out_to_ac_in1", ac.get("feed_in"))
-        )
-        return sample
+        return normalize_energy(payload)
 
     def _add_energy_sample(self, flows):
         sample = self._empty_energy_sample()
-        existing = data_watt_hours if "dc" in data_watt_hours else self._empty_energy_sample()
-        sample["dc"]["charging"] = existing["dc"].get("charging", 0) + flows["charging"]
-        sample["dc"]["discharging"] = existing["dc"].get("discharging", 0) + flows["discharging"]
+        existing = self._normalize_energy(data_watt_hours)
+        sample["dc"]["charging"] = existing["dc"]["charging"] + flows["charging"]
+        sample["dc"]["discharging"] = existing["dc"]["discharging"] + flows["discharging"]
         for key in sample["ac"]:
-            sample["ac"][key] = existing["ac"].get(key, 0) + flows["ac"].get(key, 0)
+            sample["ac"][key] = existing["ac"][key] + flows["ac"].get(key, 0)
         return sample
 
     def _accumulate_energy(self, dc_power, ac_in_total, ac_out_total):
@@ -431,14 +427,8 @@ class DbusMultiPlusEmulator:
 
         try:
             _atomic_write_json(data_watt_hours_working_file, json_data)
-            if timestamp_storage_file + data_watt_hours_save < timestamp:
-                _atomic_write_json(data_watt_hours_storage_file, json_data)
-                timestamp_storage_file = timestamp
-                logging.info("Written JSON for energy counters to persistent storage.")
         except OSError as error:
             logging.warning("Could not persist energy counters: %s", error)
-            data_watt_hours["time_creation"] = timestamp
-            data_watt_hours["count"] = 0
             return
 
         data_watt_hours = {
@@ -451,11 +441,23 @@ class DbusMultiPlusEmulator:
             "count": 1,
         }
 
+        if timestamp_storage_file + data_watt_hours_save < timestamp:
+            try:
+                _atomic_write_json(data_watt_hours_storage_file, json_data)
+                timestamp_storage_file = timestamp
+                logging.info("Written JSON for energy counters to persistent storage.")
+            except OSError as error:
+                logging.warning("Could not persist energy counters to storage: %s", error)
+
     def _phase_vi(self, power, voltage):
-        if power is None and voltage is None:
-            return {"current": None, "power": None, "voltage": None}
+        if voltage is None:
+            return {
+                "current": None,
+                "power": None if power is None else as_number(power),
+                "voltage": None,
+            }
         voltage = as_number(voltage)
-        power = as_number(power)
+        power = as_number(power) if power is not None else 0
         current = round(power / voltage, 2) if voltage > 0 else 0
         return {"current": current, "power": power, "voltage": voltage}
 
@@ -580,6 +582,8 @@ def main():
         return str("%.2f" % v) + "A"
 
     def _w(p, v):
+        if v is None:
+            return ""
         return str("%i" % v) + "W"
 
     def _va(p, v):
@@ -595,6 +599,8 @@ def main():
         return str("%i" % v) + "°C"
 
     def _percent(p, v):
+        if v is None:
+            return ""
         return str("%.1f" % v) + "%"
 
     def _n(p, v):
@@ -641,21 +647,30 @@ def main():
         # ----
         "/Ac/Out/L1/F": {"initial": None, "textformat": _hz},
         "/Ac/Out/L1/I": {"initial": None, "textformat": _a},
-        "/Ac/Out/L1/NominalInverterPower": {"initial": 4500, "textformat": _w},
+        "/Ac/Out/L1/NominalInverterPower": {
+            "initial": 4500 if "L1" in phases else None,
+            "textformat": _w,
+        },
         "/Ac/Out/L1/P": {"initial": None, "textformat": _w},
         "/Ac/Out/L1/S": {"initial": None, "textformat": _va},
         "/Ac/Out/L1/V": {"initial": None, "textformat": _v},
         # ----
         "/Ac/Out/L2/F": {"initial": None, "textformat": _hz},
         "/Ac/Out/L2/I": {"initial": None, "textformat": _a},
-        "/Ac/Out/L2/NominalInverterPower": {"initial": 4500, "textformat": _w},
+        "/Ac/Out/L2/NominalInverterPower": {
+            "initial": 4500 if "L2" in phases else None,
+            "textformat": _w,
+        },
         "/Ac/Out/L2/P": {"initial": None, "textformat": _w},
         "/Ac/Out/L2/S": {"initial": None, "textformat": _va},
         "/Ac/Out/L2/V": {"initial": None, "textformat": _v},
         # ----
         "/Ac/Out/L3/F": {"initial": None, "textformat": _hz},
         "/Ac/Out/L3/I": {"initial": None, "textformat": _a},
-        "/Ac/Out/L3/NominalInverterPower": {"initial": 4500, "textformat": _w},
+        "/Ac/Out/L3/NominalInverterPower": {
+            "initial": 4500 if "L3" in phases else None,
+            "textformat": _w,
+        },
         "/Ac/Out/L3/P": {"initial": None, "textformat": _w},
         "/Ac/Out/L3/S": {"initial": None, "textformat": _va},
         "/Ac/Out/L3/V": {"initial": None, "textformat": _v},

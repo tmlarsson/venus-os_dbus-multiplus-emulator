@@ -19,7 +19,7 @@ PV_POSITION_AC_IN1 = 0
 PV_POSITION_AC_OUTPUT = 1
 PV_POSITION_AC_IN2 = 2
 
-# Below this |sum(AC-In)|, spread DC equally instead of by phase share.
+# Below this sum(|AC-In|), spread DC equally instead of by |P| share.
 _DC_SPLIT_MIN_TOTAL = 1.0
 
 
@@ -65,9 +65,58 @@ def pv_power_on_input_and_output(inverters, phase_list):
     return on_input, on_output
 
 
+def charger_power(voltage, current, dc_power=None, yield_power=None):
+    """One solar charger's watts: V×I, else /Dc/0/Power, else /Yield/Power."""
+    if voltage is not None and current is not None:
+        return as_number(voltage) * as_number(current)
+    if dc_power is not None:
+        return as_number(dc_power)
+    return as_number(yield_power)
+
+
 def multi_dc_power(battery_power, mppt_power=0.0, dc_load_power=0.0):
     """VE.Bus DC port: battery minus DC-coupled PV plus measured DC loads."""
     return as_number(battery_power) - as_number(mppt_power) + as_number(dc_load_power)
+
+
+def normalize_energy(payload):
+    """Map stored kWh JSON onto current /Energy/* keys.
+
+    v0.0.4 stored inverter kWh only under dc.charging / dc.discharging and
+    grid under ac.from_grid / ac.feed_in. Copy those when the new keys are
+    absent so an upgrade does not publish 0 kWh.
+    """
+    payload = payload or {}
+    dc = payload.get("dc") or {}
+    ac = payload.get("ac") or {}
+    charging = as_number(dc.get("charging"))
+    discharging = as_number(dc.get("discharging"))
+    if "out_to_inverter" in ac:
+        out_to_inverter = as_number(ac.get("out_to_inverter"))
+    else:
+        out_to_inverter = charging
+    if "inverter_to_ac_out" in ac:
+        inverter_to_ac_out = as_number(ac.get("inverter_to_ac_out"))
+    else:
+        inverter_to_ac_out = discharging
+    if "ac_in1_to_ac_out" in ac:
+        ac_in1_to_ac_out = as_number(ac.get("ac_in1_to_ac_out"))
+    else:
+        ac_in1_to_ac_out = as_number(ac.get("from_grid"))
+    if "ac_out_to_ac_in1" in ac:
+        ac_out_to_ac_in1 = as_number(ac.get("ac_out_to_ac_in1"))
+    else:
+        ac_out_to_ac_in1 = as_number(ac.get("feed_in"))
+    return {
+        "dc": {"charging": charging, "discharging": discharging},
+        "ac": {
+            "ac_in1_to_ac_out": ac_in1_to_ac_out,
+            "ac_in1_to_inverter": as_number(ac.get("ac_in1_to_inverter")),
+            "out_to_inverter": out_to_inverter,
+            "inverter_to_ac_out": inverter_to_ac_out,
+            "ac_out_to_ac_in1": ac_out_to_ac_in1,
+        },
+    }
 
 
 def calculate_multi_ac_power(grid_power, pv_on_input, dc_power, phase_list):

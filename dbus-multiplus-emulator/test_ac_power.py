@@ -1,13 +1,18 @@
 #!/usr/bin/env python
 import unittest
 
+import random
+
 from ac_power import (
     PV_POSITION_AC_IN1,
     PV_POSITION_AC_IN2,
     PV_POSITION_AC_OUTPUT,
+    as_number,
     calculate_multi_ac_power,
+    charger_power,
     energy_flows,
     multi_dc_power,
+    normalize_energy,
     phase_power_or_total,
     pv_power_on_input_and_output,
     venus_consumption,
@@ -88,6 +93,12 @@ class PhasePowerFallbackTests(unittest.TestCase):
         )
         self.assertEqual(resolved, {"L1": 0, "L2": 0, "L3": 0})
 
+    def test_mqtt_grid_total_fills_l1(self):
+        resolved = phase_power_or_total(
+            {"L1": None, "L2": None, "L3": None}, 5000, PHASES
+        )
+        self.assertEqual(sum(as_number(value) for value in resolved.values()), 5000)
+
 
 class ConsumptionAccountingTests(unittest.TestCase):
     def test_pv_on_input_export_is_not_counted_as_consumption(self):
@@ -154,6 +165,56 @@ class ConsumptionAccountingTests(unittest.TestCase):
         consumption = _consumption(_single(0), _single(0), _single(0), dc)
         self.assertAlmostEqual(consumption, 2000, places=4)
 
+    def test_mqtt_grid_total_becomes_ac_in(self):
+        grid = phase_power_or_total(
+            {"L1": None, "L2": None, "L3": None}, 5000, PHASES
+        )
+        ac_in, ac_out = calculate_multi_ac_power(grid, _single(0), 0, PHASES)
+        self.assertAlmostEqual(sum(ac_in.values()), 5000)
+        self.assertAlmostEqual(sum(ac_out.values()), 5000)
+
+
+class ChargerPowerTests(unittest.TestCase):
+    def test_prefers_voltage_times_current(self):
+        self.assertAlmostEqual(charger_power(50, 10, dc_power=1, yield_power=1), 500)
+
+    def test_falls_back_to_dc_power(self):
+        self.assertAlmostEqual(charger_power(50, None, dc_power=1800), 1800)
+
+    def test_falls_back_to_yield_power(self):
+        self.assertAlmostEqual(
+            charger_power(50, None, dc_power=None, yield_power=1800), 1800
+        )
+
+
+class EnergyNormalizeTests(unittest.TestCase):
+    def test_v004_json_keeps_inverter_kwh(self):
+        migrated = normalize_energy(
+            {
+                "dc": {"charging": 12.3, "discharging": 45.6},
+                "ac": {"from_grid": 1, "feed_in": 2},
+            }
+        )
+        self.assertAlmostEqual(migrated["ac"]["inverter_to_ac_out"], 45.6)
+        self.assertAlmostEqual(migrated["ac"]["out_to_inverter"], 12.3)
+        self.assertAlmostEqual(migrated["ac"]["ac_in1_to_ac_out"], 1)
+        self.assertAlmostEqual(migrated["ac"]["ac_out_to_ac_in1"], 2)
+
+    def test_new_keys_are_not_overwritten_by_dc(self):
+        migrated = normalize_energy(
+            {
+                "dc": {"charging": 12.3, "discharging": 45.6},
+                "ac": {
+                    "out_to_inverter": 1.0,
+                    "inverter_to_ac_out": 2.0,
+                    "ac_in1_to_ac_out": 3.0,
+                    "ac_out_to_ac_in1": 4.0,
+                },
+            }
+        )
+        self.assertAlmostEqual(migrated["ac"]["out_to_inverter"], 1.0)
+        self.assertAlmostEqual(migrated["ac"]["inverter_to_ac_out"], 2.0)
+
 
 class EnergyFlowTests(unittest.TestCase):
     def test_charging_splits_passthrough_and_ac_in_to_inverter(self):
@@ -174,6 +235,26 @@ class EnergyFlowTests(unittest.TestCase):
         self.assertAlmostEqual(flows["ac_in1_to_inverter"], 0)
         self.assertAlmostEqual(flows["out_to_inverter"], 3000)
         self.assertAlmostEqual(flows["ac_out_to_ac_in1"], 1000)
+
+    def test_ac_in_paths_do_not_exceed_abs_ac_in(self):
+        rng = random.Random(0)
+        for _ in range(50):
+            ac_in = rng.uniform(-20000, 20000)
+            ac_out = rng.uniform(-20000, 20000)
+            dc = rng.uniform(-10000, 10000)
+            ac_in_p, ac_out_p = calculate_multi_ac_power(
+                _single(ac_in), _single(0), dc, PHASES
+            )
+            self.assertAlmostEqual(
+                sum(ac_out_p.values()), sum(ac_in_p.values()) - dc, places=4
+            )
+            flows = energy_flows(sum(ac_in_p.values()), sum(ac_out_p.values()), dc)
+            used = (
+                flows["ac_in1_to_ac_out"]
+                + flows["ac_in1_to_inverter"]
+                + flows["ac_out_to_ac_in1"]
+            )
+            self.assertLessEqual(used, abs(sum(ac_in_p.values())) + 1e-6)
 
 
 if __name__ == "__main__":

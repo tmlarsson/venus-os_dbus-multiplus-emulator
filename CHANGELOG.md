@@ -12,6 +12,9 @@
 * Fixed: Corrupt energy JSON no longer restart-loops the service; writes are atomic
 * Fixed: `ChargeMode` and `Power/Current==0` no longer abort the rest of `_update()`
 * Fixed: `/Ac/NumberOfPhases` follows the configured `phases` list
+* Fixed: v0.0.4 energy JSON keeps inverter kWh after the key rename
+* Fixed: failed `/data` persist no longer double-counts the last energy window
+* Fixed: MQTT grid `/Ac/Power` and MPPT `/Dc/0/Power` or `/Yield/Power` are used when phase/current paths are missing
 
 ## v0.0.4
 * Fixed: Solar export was counted as consumption because Multi AC-In copied the grid meter and ignored PV on AC-in
