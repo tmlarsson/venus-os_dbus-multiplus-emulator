@@ -14,6 +14,7 @@ from ac_power import (
     multi_dc_power,
     normalize_energy,
     phase_power_or_total,
+    select_energy_payload,
     pv_power_on_input_and_output,
     venus_consumption,
 )
@@ -199,6 +200,19 @@ class EnergyNormalizeTests(unittest.TestCase):
         self.assertAlmostEqual(migrated["ac"]["out_to_inverter"], 12.3)
         self.assertAlmostEqual(migrated["ac"]["ac_in1_to_ac_out"], 1)
         self.assertAlmostEqual(migrated["ac"]["ac_out_to_ac_in1"], 2)
+
+    def test_corrupt_working_json_falls_back_to_storage(self):
+        storage = {
+            "dc": {"charging": 12.3, "discharging": 45.6},
+            "ac": {"from_grid": 1, "feed_in": 2},
+        }
+        chosen = select_energy_payload({}, storage)
+        migrated = normalize_energy(chosen)
+        self.assertAlmostEqual(migrated["ac"]["out_to_inverter"], 12.3)
+        self.assertAlmostEqual(migrated["ac"]["inverter_to_ac_out"], 45.6)
+
+        chosen_none = select_energy_payload(None, storage)
+        self.assertEqual(chosen_none, storage)
 
     def test_new_keys_are_not_overwritten_by_dc(self):
         migrated = normalize_energy(

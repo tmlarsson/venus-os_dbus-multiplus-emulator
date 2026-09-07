@@ -17,9 +17,11 @@ from ac_power import (
     calculate_multi_ac_power,
     charger_power,
     energy_flows,
+    energy_payload_usable,
     multi_dc_power,
     normalize_energy,
     phase_power_or_total,
+    select_energy_payload,
     pv_power_on_input_and_output,
 )
 
@@ -65,12 +67,15 @@ data_watt_hours_working_file = (
 
 
 def _load_energy_json(path):
+    if not os.path.isfile(path):
+        return None
     try:
         with open(path, "r") as handle:
-            return json.load(handle)
+            payload = json.load(handle)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         logging.warning("Could not load %s: %s", path, error)
-        return {}
+        return None
+    return payload
 
 
 def _atomic_write_json(path, payload):
@@ -91,14 +96,13 @@ timestamp_storage_file = (
     else 0
 )
 
-if os.path.isfile(data_watt_hours_working_file):
-    json_data = _load_energy_json(data_watt_hours_working_file)
+_working_energy = _load_energy_json(data_watt_hours_working_file)
+_storage_energy = _load_energy_json(data_watt_hours_storage_file)
+json_data = select_energy_payload(_working_energy, _storage_energy)
+if energy_payload_usable(_working_energy):
     logging.info("Loaded JSON energy counters from volatile storage")
-elif os.path.isfile(data_watt_hours_storage_file):
-    json_data = _load_energy_json(data_watt_hours_storage_file)
+elif energy_payload_usable(_storage_energy):
     logging.info("Loaded JSON energy counters from persistent storage")
-else:
-    json_data = {}
 
 
 class DbusMultiPlusEmulator:
@@ -396,16 +400,12 @@ class DbusMultiPlusEmulator:
             data_watt_hours["count"] = data_watt_hours.get("count", 0) + 1
             return
 
-        if os.path.isfile(data_watt_hours_working_file):
-            data_watt_hours_old = self._normalize_energy(
-                _load_energy_json(data_watt_hours_working_file)
+        data_watt_hours_old = self._normalize_energy(
+            select_energy_payload(
+                _load_energy_json(data_watt_hours_working_file),
+                _load_energy_json(data_watt_hours_storage_file),
             )
-        elif os.path.isfile(data_watt_hours_storage_file):
-            data_watt_hours_old = self._normalize_energy(
-                _load_energy_json(data_watt_hours_storage_file)
-            )
-        else:
-            data_watt_hours_old = self._empty_energy_sample()
+        )
 
         factor = (timestamp - data_watt_hours["time_creation"]) / 3600
         count = data_watt_hours.get("count") or 1
@@ -874,7 +874,7 @@ def main():
         "/Leds/Temperature": {"initial": 0, "textformat": _n},
         "/Mode": {"initial": 3, "textformat": _n},
         "/ModeIsAdjustable": {"initial": 1, "textformat": _n},
-        "/PvInverter/Disable": {"initial": 1, "textformat": _n},
+        "/PvInverter/Disable": {"initial": 0, "textformat": _n},
         "/Quirks": {"initial": 0, "textformat": _n},
         "/RedetectSystem": {"initial": 0, "textformat": _n},
         "/Settings/Alarm/System/GridLost": {"initial": 1, "textformat": _n},

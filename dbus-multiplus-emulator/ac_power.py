@@ -119,6 +119,20 @@ def normalize_energy(payload):
     }
 
 
+def energy_payload_usable(payload):
+    """True when JSON has energy keys; empty/corrupt loads are not usable."""
+    return isinstance(payload, dict) and ("dc" in payload or "ac" in payload)
+
+
+def select_energy_payload(working, storage):
+    """Prefer volatile JSON; skip empty/invalid working data for /data."""
+    if energy_payload_usable(working):
+        return working
+    if energy_payload_usable(storage):
+        return storage
+    return {}
+
+
 def calculate_multi_ac_power(grid_power, pv_on_input, dc_power, phase_list):
     """Return (ac_in, ac_out) power dicts per phase.
 
